@@ -18,8 +18,10 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from core import (
+    ADULT_RP_ACTIONS,
     BATTLE_PASS_MAX_LEVEL,
     BATTLE_PASS_REWARDS,
+    RP_ACTIONS,
     get_adult_rp_action,
     get_rp_action_by_alias,
 )
@@ -30,18 +32,23 @@ from database import (
     get_or_create_chat,
     get_or_create_member,
     get_or_create_user,
+    get_top_by_penis_size,
 )
 
 from services import (
     ServiceResult,
+    abort_child,
     add_warning,
     admin_give_money,
     admin_set_balance,
     admin_set_level,
     admin_take_money,
+    assign_staff_role,
     balance_user,
+    check_moderation_access,
     claim_daily_bonus,
     create_giveaway,
+    finish_giveaway,
     format_balance,
     format_inventory,
     format_other_profile,
@@ -53,6 +60,8 @@ from services import (
     get_warnings,
     handle_message,
     join_giveaway,
+    join_tictactoe,
+    masturbate,
     moderate_ban,
     moderate_kick,
     moderate_mute,
@@ -69,18 +78,17 @@ from services import (
     play_roulette,
     play_slots,
     purge_messages,
+    remove_staff_role,
     remove_warning,
     rob_user,
     select_tag,
     set_moderation_permission,
     set_profile_nick,
-    set_profile_tag,
     start_tictactoe,
     tictactoe_move,
     transfer_money,
-    assign_staff_role,
-    remove_staff_role,
-    finish_giveaway,
+    use_medicine,
+    visit_venereologist,
 )
 
 logger = logging.getLogger("EzzzyGameBot.handlers")
@@ -268,6 +276,16 @@ async def resolve_user_id(
         return result.scalar_one_or_none()
 
 
+def reply_target_id(message: Message) -> Optional[int]:
+    if not message.reply_to_message:
+        return None
+
+    if not message.reply_to_message.from_user:
+        return None
+
+    return message.reply_to_message.from_user.id
+
+
 # ============================================================================
 # START / HELP
 # ============================================================================
@@ -309,7 +327,8 @@ async def cmd_help(message: Message) -> None:
             "/inventory\n"
             "/tag\n"
             "/battlepass\n"
-            "/top\n\n"
+            "/top\n"
+            "/topsize\n\n"
             "<b>🎮 Игры</b>\n"
             "/games\n"
             "/bonus\n"
@@ -323,6 +342,7 @@ async def cmd_help(message: Message) -> None:
             "/ttt\n\n"
             "<b>💰 Экономика</b>\n"
             "/pay 100 ответом\n"
+            "/masturbate\n"
             "/rob ответом\n\n"
             "<b>🎭 RP</b>\n"
             "обычные RP-команды работают текстом\n"
@@ -390,7 +410,171 @@ async def cmd_profile(
                 user_id=target_id,
             )
 
-    await reply(message, text)
+        keyboard = None
+
+        if target_id == message.from_user.id:
+            member = await get_or_create_member(
+                session=session,
+                chat_id=message.chat.id,
+                user_id=target_id,
+            )
+
+            buttons = []
+
+            if member.has_disease:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text="💊 Лекарство",
+                            callback_data=f"profile:medicine:{target_id}",
+                        ),
+                        InlineKeyboardButton(
+                            text="🧑‍⚕️ Венеролог",
+                            callback_data=f"profile:venereologist:{target_id}",
+                        ),
+                    ]
+                )
+
+            if member.has_child:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text="🏥 Аборт",
+                            callback_data=f"profile:abort:{target_id}",
+                        )
+                    ]
+                )
+
+            if buttons:
+                keyboard = InlineKeyboardMarkup(
+                    inline_keyboard=buttons
+                )
+
+    await reply(
+        message,
+        text,
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("profile:"))
+async def callback_profile_action(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    parts = (callback.data or "").split(":")
+
+    if len(parts) != 3:
+        await callback.answer(
+            "Некорректное действие.",
+            show_alert=True,
+        )
+        return
+
+    action = parts[1]
+
+    try:
+        target_id = int(parts[2])
+    except ValueError:
+        await callback.answer(
+            "Некорректный профиль.",
+            show_alert=True,
+        )
+        return
+
+    if callback.from_user.id != target_id:
+        await callback.answer(
+            "Эта кнопка предназначена владельцу профиля.",
+            show_alert=True,
+        )
+        return
+
+    handlers = {
+        "medicine": use_medicine,
+        "venereologist": visit_venereologist,
+        "abort": abort_child,
+    }
+
+    handler = handlers.get(action)
+
+    if handler is None:
+        await callback.answer(
+            "Неизвестное действие.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await handler(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=target_id,
+        )
+
+        if result.success:
+            await session.commit()
+
+        text = await format_profile(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=target_id,
+        )
+
+        member = await get_or_create_member(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=target_id,
+        )
+
+        buttons = []
+
+        if member.has_disease:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="💊 Лекарство",
+                        callback_data=f"profile:medicine:{target_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="🧑‍⚕️ Венеролог",
+                        callback_data=f"profile:venereologist:{target_id}",
+                    ),
+                ]
+            )
+
+        if member.has_child:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="🏥 Аборт",
+                        callback_data=f"profile:abort:{target_id}",
+                    )
+                ]
+            )
+
+        keyboard = (
+            InlineKeyboardMarkup(
+                inline_keyboard=buttons
+            )
+            if buttons
+            else None
+        )
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
+
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard,
+        )
+    except TelegramBadRequest:
+        pass
 
 
 @router.message(Command("stats"))
@@ -545,7 +729,11 @@ async def cmd_battlepass(message: Message) -> None:
 
         current_xp = member.battle_pass_xp
         level_xp = current_xp % 100
-        remaining = 0 if level >= BATTLE_PASS_MAX_LEVEL else 100 - level_xp
+        remaining = (
+            0
+            if level >= BATTLE_PASS_MAX_LEVEL
+            else 100 - level_xp
+        )
 
         reward_text = "—"
 
@@ -587,6 +775,39 @@ async def cmd_top(message: Message) -> None:
         )
 
     await reply(message, text)
+
+
+@router.message(Command("topsize"))
+async def cmd_topsize(message: Message) -> None:
+    if not is_group(message):
+        await reply(
+            message,
+            "🏆 Рейтинг доступен в группах.",
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        members = await get_top_by_penis_size(
+            session=session,
+            chat_id=message.chat.id,
+            limit=10,
+        )
+
+        lines = [
+            "📏 <b>Топ по размеру</b>"
+        ]
+
+        for index, member in enumerate(members, 1):
+            lines.append(
+                f'{index}. '
+                f'<a href="tg://user?id={member.user_id}">Игрок</a> — '
+                f"<b>{member.penis_size:.2f} см</b>"
+            )
+
+    await reply(
+        message,
+        "\n".join(lines),
+    )
 
 
 @router.message(Command("bonus"))
@@ -651,6 +872,24 @@ async def cmd_pay(
             sender_id=message.from_user.id,
             receiver_id=target.id,
             amount=amount,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(message, result.message)
+
+
+@router.message(Command("masturbate"))
+async def cmd_masturbate(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await masturbate(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
         )
 
         if result.success:
@@ -813,16 +1052,11 @@ async def cmd_roulette(
     if len(args) < 2:
         await reply(
             message,
-            (
-                "🎡 Формат:\n"
-                "<code>/roulette 100 red</code>\n\n"
-                "Варианты: red, black, green"
-            ),
+            "🎡 Пример: <code>/roulette 100 red</code>",
         )
         return
 
     bet = parse_integer(args[0])
-    choice = args[1].lower()
 
     if bet is None:
         await reply(
@@ -837,7 +1071,7 @@ async def cmd_roulette(
             chat_id=message.chat.id,
             user_id=message.from_user.id,
             bet=bet,
-            choice=choice,
+            color=args[1],
         )
 
         if result.success:
@@ -856,7 +1090,7 @@ async def cmd_guess(
 
     args = (command.args or "").split()
 
-    if len(args) < 2:
+    if len(args) != 2:
         await reply(
             message,
             "🔢 Пример: <code>/guess 100 5</code>",
@@ -950,8 +1184,125 @@ async def cmd_basketball(
     await reply(message, result.message)
 
 
+@router.message(Command("ttt"))
+async def cmd_ttt(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await start_tictactoe(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(
+        message,
+        result.message,
+        reply_markup=result.keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("tttjoin:"))
+async def callback_ttt_join(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    try:
+        game_id = int(
+            (callback.data or "").split(":", 1)[1]
+        )
+    except (ValueError, IndexError):
+        await callback.answer(
+            "Некорректная игра.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await join_tictactoe(
+            session=session,
+            game_id=game_id,
+            user_id=callback.from_user.id,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
+
+    if result.success:
+        try:
+            await callback.message.edit_text(
+                result.message,
+                reply_markup=result.keyboard,
+            )
+        except TelegramBadRequest:
+            pass
+
+
+@router.callback_query(F.data.startswith("tttmove:"))
+async def callback_ttt_move(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    parts = (callback.data or "").split(":")
+
+    if len(parts) != 3:
+        await callback.answer(
+            "Некорректный ход.",
+            show_alert=True,
+        )
+        return
+
+    game_id = parse_integer(parts[1])
+    cell = parse_integer(parts[2])
+
+    if game_id is None or cell is None:
+        await callback.answer(
+            "Некорректный ход.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await tictactoe_move(
+            session=session,
+            game_id=game_id,
+            user_id=callback.from_user.id,
+            cell=cell,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
+
+    if result.success:
+        try:
+            await callback.message.edit_text(
+                result.message,
+                reply_markup=result.keyboard,
+            )
+        except TelegramBadRequest:
+            pass
+
+
 @router.callback_query(F.data == "games:menu")
-async def callback_games_menu(callback: CallbackQuery) -> None:
+async def callback_games_menu(
+    callback: CallbackQuery,
+) -> None:
     if not callback.message:
         await callback.answer()
         return
@@ -970,186 +1321,9 @@ async def callback_games_menu(callback: CallbackQuery) -> None:
         pass
 
 
-@router.callback_query(F.data.startswith("game:"))
-async def callback_game(callback: CallbackQuery) -> None:
-    if not callback.message:
-        await callback.answer()
-        return
-
-    game_type = callback.data.split(":", 1)[1]
-
-    labels = {
-        "coinflip": "🪙 Монетка",
-        "dice": "🎲 Кубики",
-        "slots": "🎰 Слоты",
-        "roulette": "🎡 Рулетка",
-        "guess": "🔢 Угадай число",
-        "football": "⚽ Футбол",
-        "basketball": "🏀 Баскетбол",
-        "tictactoe": "⭕❌ Крестики-нолики",
-    }
-
-    examples = {
-        "coinflip": "/coinflip 100",
-        "dice": "/dice 100",
-        "slots": "/slots 100",
-        "roulette": "/roulette 100 red",
-        "guess": "/guess 100 5",
-        "football": "/football 100",
-        "basketball": "/basketball 100",
-        "tictactoe": "/ttt",
-    }
-
-    if game_type not in labels:
-        await callback.answer(
-            "Неизвестная игра.",
-            show_alert=True,
-        )
-        return
-
-    await callback.answer()
-
-    try:
-        await callback.message.edit_text(
-            (
-                f"<b>{labels[game_type]}</b>\n\n"
-                f"Команда: <code>{examples[game_type]}</code>"
-            ),
-            reply_markup=back_keyboard(),
-        )
-    except TelegramBadRequest:
-        pass
-
-
-# ============================================================================
-# TIC TAC TOE
-# ============================================================================
-
-
-@router.message(Command("ttt"))
-async def cmd_ttt(message: Message) -> None:
-    if not message.from_user:
-        return
-
-    args = (message.text or "").split()
-
-    bet = 10
-
-    if len(args) > 1:
-        parsed = parse_integer(args[1])
-
-        if parsed is not None:
-            bet = parsed
-
-    async with AsyncSessionLocal() as session:
-        result = await start_tictactoe(
-            session=session,
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            bet=bet,
-        )
-
-        if result.success:
-            await session.commit()
-
-    await reply(
-        message,
-        result.message,
-        reply_markup=result.keyboard,
-    )
-
-
-@router.callback_query(F.data.startswith("ttt:"))
-async def callback_ttt(callback: CallbackQuery) -> None:
-    if not callback.message or not callback.from_user:
-        await callback.answer()
-        return
-
-    parts = callback.data.split(":")
-
-    if len(parts) != 3:
-        await callback.answer(
-            "Некорректный ход.",
-            show_alert=True,
-        )
-        return
-
-    try:
-        game_id = int(parts[1])
-        position = int(parts[2])
-    except ValueError:
-        await callback.answer(
-            "Некорректный ход.",
-            show_alert=True,
-        )
-        return
-
-    async with AsyncSessionLocal() as session:
-        result = await tictactoe_move(
-            session=session,
-            game_id=game_id,
-            user_id=callback.from_user.id,
-            position=position,
-        )
-
-        if result.success:
-            await session.commit()
-
-    await callback.answer(
-        result.answer or "",
-        show_alert=result.show_alert,
-    )
-
-    if result.success and callback.message:
-        try:
-            await callback.message.edit_text(
-                result.message,
-                reply_markup=result.keyboard,
-            )
-        except TelegramBadRequest:
-            pass
-
-
 # ============================================================================
 # RP
 # ============================================================================
-
-
-def _extract_rp_target(
-    message: Message,
-    target_text: str,
-) -> tuple[Optional[int], Optional[str]]:
-    target_user_id: Optional[int] = None
-    target_name: Optional[str] = None
-
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-
-        if target:
-            target_user_id = target.id
-            target_name = (
-                f"@{escape(target.username)}"
-                if target.username
-                else escape(target.full_name or "Игрок")
-            )
-
-            return target_user_id, target_name
-
-    if target_text.startswith("@"):
-        target_name = escape(
-            target_text.split()[0]
-        )
-
-    if message.entities:
-        for entity in message.entities:
-            if entity.type == "text_mention" and entity.user:
-                target_user_id = entity.user.id
-                target_name = escape(
-                    entity.user.full_name or "Игрок"
-                )
-                return target_user_id, target_name
-
-    return target_user_id, target_name
 
 
 def parse_rp_text(
@@ -1165,26 +1339,40 @@ def parse_rp_text(
     if not parts:
         return "", ""
 
-    normalized = " ".join(
-        part.lower()
-        for part in parts
-    )
+    words = [part.lower() for part in parts]
+    candidates: set[str] = set()
 
-    words = normalized.split()
+    for data in RP_ACTIONS.values():
+        for alias in data.get("aliases", ()):
+            candidates.add(
+                " ".join(
+                    str(alias).lower().split()
+                )
+            )
 
-    multiword = {
-        "дать пять",
-        "дать подзатыльник",
-        "кинуть тапок",
-    }
+    for data in ADULT_RP_ACTIONS.values():
+        for alias in data.aliases:
+            candidates.add(
+                " ".join(
+                    str(alias).lower().split()
+                )
+            )
 
-    if len(words) >= 2:
-        candidate = f"{words[0]} {words[1]}"
+    for candidate in sorted(
+        candidates,
+        key=lambda value: (
+            len(value.split()),
+            len(value),
+        ),
+        reverse=True,
+    ):
+        candidate_words = candidate.split()
+        size = len(candidate_words)
 
-        if candidate in multiword:
+        if words[:size] == candidate_words:
             return (
                 candidate,
-                " ".join(parts[2:]),
+                " ".join(parts[size:]),
             )
 
     return (
@@ -1196,140 +1384,108 @@ def parse_rp_text(
 async def execute_rp(
     message: Message,
 ) -> Optional[ServiceResult]:
-    if not message.from_user or not is_group(message):
+    if not message.from_user:
         return None
 
-    action, target_text = parse_rp_text(message)
+    action_alias, target_text = parse_rp_text(message)
 
-    if not action:
+    if not action_alias:
         return None
 
-    target_user_id, target_name = _extract_rp_target(
-        message,
-        target_text,
-    )
+    adult_action = get_adult_rp_action(action_alias)
 
-    async with AsyncSessionLocal() as session:
-        adult_action = get_adult_rp_action(action)
+    if adult_action is not None:
+        target_id = None
 
-        if adult_action is not None:
+        if message.reply_to_message:
+            target = message.reply_to_message.from_user
+
+            if target:
+                target_id = target.id
+
+        if target_id is None and target_text:
+            parsed = parse_integer(
+                target_text.split()[0]
+            )
+
+            if parsed is not None:
+                target_id = parsed
+
+        if target_id is None:
+            return ServiceResult(
+                success=False,
+                message=(
+                    "🎭 18+ RP нужно использовать "
+                    "ответом на сообщение пользователя."
+                ),
+                answer="Нет цели.",
+                show_alert=True,
+            )
+
+        async with AsyncSessionLocal() as session:
             result = await perform_adult_rp(
                 session=session,
                 chat_id=message.chat.id,
                 actor_id=message.from_user.id,
-                action=action,
-                target_id=target_user_id,
-                target_name=target_name,
-            )
-        else:
-            normal_action = get_rp_action_by_alias(action)
-
-            if normal_action is None:
-                return None
-
-            result = await perform_rp(
-                session=session,
-                chat_id=message.chat.id,
-                actor_id=message.from_user.id,
-                action=action,
-                target_id=target_user_id,
-                target_name=target_name,
+                target_id=target_id,
+                action=adult_action.key,
             )
 
-        if result.success:
-            await session.commit()
+            if result.success:
+                await session.commit()
 
         return result
 
+    action = get_rp_action_by_alias(action_alias)
 
-@router.message(
-    F.text.regexp(
-        r"^(?:[/!])?(обнять|пожать|поцеловать|пнуть|ударить|"
-        r"погладить|подмигнуть|дать\s+пять|поздравить|пожалеть|"
-        r"рассмешить|напугать|ткнуть|укусить|дать\s+подзатыльник|"
-        r"кинуть\s+тапок)(?:\s+.+)?$"
-    )
-)
-async def rp_handler(message: Message) -> None:
-    result = await execute_rp(message)
+    if action is None:
+        return None
 
-    if result is not None:
-        await reply(
-            message,
-            result.message,
+    target_id = None
+
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+
+        if target:
+            target_id = target.id
+
+    if target_id is None and target_text:
+        parsed = parse_integer(
+            target_text.split()[0]
         )
 
+        if parsed is not None:
+            target_id = parsed
 
-# ============================================================================
-# PROFILE SETTINGS
-# ============================================================================
-
-
-@router.message(Command("setnick"))
-async def cmd_setnick(
-    message: Message,
-    command: CommandObject,
-) -> None:
-    if not message.from_user:
-        return
-
-    nick = (command.args or "").strip()
-
-    if not nick:
-        await reply(
-            message,
-            "✏️ Пример: <code>/setnick Батя</code>",
+    if target_id is None:
+        return ServiceResult(
+            success=False,
+            message=(
+                "🎭 Используй RP-команду "
+                "ответом на сообщение пользователя."
+            ),
+            answer="Нет цели.",
+            show_alert=True,
         )
-        return
 
     async with AsyncSessionLocal() as session:
-        result = await set_profile_nick(
+        result = await perform_rp(
             session=session,
             chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            nick=nick,
+            actor_id=message.from_user.id,
+            target_id=target_id,
+            action=action.key,
         )
 
         if result.success:
             await session.commit()
 
-    await reply(message, result.message)
-
-
-@router.message(Command("settag"))
-async def cmd_settag(
-    message: Message,
-    command: CommandObject,
-) -> None:
-    if not message.from_user:
-        return
-
-    tag = (command.args or "").strip()
-
-    async with AsyncSessionLocal() as session:
-        result = await set_profile_tag(
-            session=session,
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            tag=tag,
-        )
-
-    await reply(message, result.message)
+    return result
 
 
 # ============================================================================
 # MODERATION
 # ============================================================================
-
-
-def reply_target_id(message: Message) -> Optional[int]:
-    if (
-        message.reply_to_message
-        and message.reply_to_message.from_user
-    ):
-        return message.reply_to_message.from_user.id
-
-    return None
 
 
 @router.message(Command("warn"))
@@ -1345,7 +1501,7 @@ async def cmd_warn(
     if target_id is None:
         await reply(
             message,
-            "⚠️ Используй /warn ответом на сообщение.",
+            "Используй /warn ответом на сообщение.",
         )
         return
 
@@ -1355,7 +1511,7 @@ async def cmd_warn(
         result = await add_warning(
             session=session,
             chat_id=message.chat.id,
-            target_user_id=target_id,
+            user_id=target_id,
             moderator_id=message.from_user.id,
             reason=reason,
         )
@@ -1364,26 +1520,6 @@ async def cmd_warn(
             await session.commit()
 
     await reply(message, result.message)
-
-
-@router.message(Command("warnings"))
-async def cmd_warnings(message: Message) -> None:
-    if not message.from_user:
-        return
-
-    target_id = (
-        reply_target_id(message)
-        or message.from_user.id
-    )
-
-    async with AsyncSessionLocal() as session:
-        result = await get_warnings(
-            session=session,
-            chat_id=message.chat.id,
-            user_id=target_id,
-        )
-
-    await reply(message, result)
 
 
 @router.message(Command("unwarn"))
@@ -1412,6 +1548,26 @@ async def cmd_unwarn(message: Message) -> None:
             await session.commit()
 
     await reply(message, result.message)
+
+
+@router.message(Command("warnings"))
+async def cmd_warnings(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    target_id = reply_target_id(message)
+
+    if target_id is None:
+        target_id = message.from_user.id
+
+    async with AsyncSessionLocal() as session:
+        text = await get_warnings(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=target_id,
+        )
+
+    await reply(message, text)
 
 
 @router.message(Command("mute"))
@@ -2017,7 +2173,9 @@ async def cmd_giveaway(
         prize_item_code = args[1]
 
     elif prize_type == "external":
-        prize_description = " ".join(args[1:-1]).strip()
+        prize_description = " ".join(
+            args[1:-1]
+        ).strip()
 
         if not prize_description:
             await reply(
@@ -2038,6 +2196,20 @@ async def cmd_giveaway(
     )
 
     async with AsyncSessionLocal() as session:
+        allowed, error = await check_moderation_access(
+            session=session,
+            chat_id=message.chat.id,
+            actor_id=message.from_user.id,
+            command="giveaway",
+        )
+
+        if not allowed:
+            await reply(
+                message,
+                error or "❌ Недостаточно прав.",
+            )
+            return
+
         result = await create_giveaway(
             session=session,
             chat_id=message.chat.id,
@@ -2052,7 +2224,49 @@ async def cmd_giveaway(
         if result.success:
             await session.commit()
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+        reply_markup=result.keyboard,
+    )
+
+
+@router.callback_query(
+    F.data.startswith("giveaway:join:")
+)
+async def callback_giveaway_join(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    try:
+        giveaway_id = int(
+            (callback.data or "").split(":")[2]
+        )
+    except (ValueError, IndexError):
+        await callback.answer(
+            "Некорректный розыгрыш.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await join_giveaway(
+            session=session,
+            giveaway_id=giveaway_id,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
 
 
 @router.message(Command("giveaway_join"))
@@ -2091,6 +2305,9 @@ async def cmd_giveaway_finish(
     message: Message,
     command: CommandObject,
 ) -> None:
+    if not message.from_user:
+        return
+
     giveaway_id = parse_integer(command.args)
 
     if giveaway_id is None:
@@ -2101,6 +2318,20 @@ async def cmd_giveaway_finish(
         return
 
     async with AsyncSessionLocal() as session:
+        allowed, error = await check_moderation_access(
+            session=session,
+            chat_id=message.chat.id,
+            actor_id=message.from_user.id,
+            command="giveaway",
+        )
+
+        if not allowed:
+            await reply(
+                message,
+                error or "❌ Недостаточно прав.",
+            )
+            return
+
         result = await finish_giveaway(
             session=session,
             giveaway_id=giveaway_id,
@@ -2178,6 +2409,7 @@ async def global_error_handler(event) -> None:
 
 def register_handlers(dispatcher) -> None:
     dispatcher.include_router(router)
+
     logger.info(
         "Основной router зарегистрирован."
     )
