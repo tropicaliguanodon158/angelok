@@ -1,17 +1,7 @@
 """
 Ezzzy Game Bot
 ==============
-Главная точка запуска Telegram-бота.
-
-Архитектура проекта:
-    bot.py       — запуск приложения, конфигурация, lifecycle
-    core.py      — общие настройки, константы, вспомогательная инфраструктура
-    database.py  — SQLAlchemy-модели и работа с БД
-    handlers.py  — Telegram-хендлеры и команды
-    services.py  — игровая логика, экономика, уровни, RP, модерация
-
-Запуск:
-    python bot.py
+bot.py — точка запуска приложения.
 """
 
 from __future__ import annotations
@@ -21,41 +11,50 @@ import logging
 import os
 import sys
 from contextlib import suppress
+
 from dotenv import load_dotenv
 
-# Загружаем .env ДО импорта модулей проекта,
-# которые читают конфигурацию при импорте.
+# .env должен быть загружен до импорта модулей проекта.
 load_dotenv()
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import (
     BotCommand,
-    BotCommandScopeDefault,
     BotCommandScopeAllGroupChats,
+    BotCommandScopeDefault,
 )
 
-from core import APP_NAME, APP_VERSION, close_application, initialize_application
-from database import close_database, initialize_database
+from core import (
+    APP_NAME,
+    APP_VERSION,
+    close_application,
+    initialize_application,
+)
+from database import (
+    close_database,
+    initialize_database,
+)
 from handlers import register_handlers
 
 
 # ============================================================================
-# ОКРУЖЕНИЕ
+# LOGGING
 # ============================================================================
 
-load_dotenv()
-
-
-# ============================================================================
-# ЛОГИРОВАНИЕ
-# ============================================================================
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv(
+    "LOG_LEVEL",
+    "INFO",
+).upper()
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(
+        logging,
+        LOG_LEVEL,
+        logging.INFO,
+    ),
     format=(
         "%(asctime)s | "
         "%(levelname)-8s | "
@@ -69,52 +68,34 @@ logger = logging.getLogger(APP_NAME)
 
 
 # ============================================================================
-# КОНФИГУРАЦИЯ
+# CONFIG
 # ============================================================================
 
-
 def get_bot_token() -> str:
-    """
-    Получает Telegram Bot Token из переменной окружения.
-
-    BOT_TOKEN должен находиться в .env:
-
-        BOT_TOKEN=123456:ABCDEF...
-
-    Если токен отсутствует, приложение не запускается.
-    """
-
-    token = os.getenv("BOT_TOKEN", "").strip()
+    token = os.getenv(
+        "BOT_TOKEN",
+        "",
+    ).strip()
 
     if not token:
-        logger.critical(
-            "Не найден BOT_TOKEN. "
-            "Добавь токен Telegram-бота в файл .env."
-        )
         raise RuntimeError(
             "BOT_TOKEN не задан. "
-            "Создай .env и добавь BOT_TOKEN=<твой_токен>."
+            "Добавь BOT_TOKEN=<твой_токен> в .env."
         )
 
     return token
 
 
 def get_owner_id() -> int:
-    """
-    Получает Telegram ID владельца бота.
-
-    OWNER_ID нужен для глобальных административных функций.
-
-    Если OWNER_ID не указан, бот всё равно сможет запуститься,
-    но глобальные owner-команды будут недоступны.
-    """
-
-    raw_owner_id = os.getenv("OWNER_ID", "").strip()
+    raw_owner_id = os.getenv(
+        "OWNER_ID",
+        "",
+    ).strip()
 
     if not raw_owner_id:
         logger.warning(
             "OWNER_ID не задан. "
-            "Глобальные команды владельца будут недоступны."
+            "Глобальные owner-функции будут недоступны."
         )
         return 0
 
@@ -125,7 +106,7 @@ def get_owner_id() -> int:
             "OWNER_ID должен быть числом."
         ) from exc
 
-    if owner_id < 1:
+    if owner_id <= 0:
         raise RuntimeError(
             "OWNER_ID должен быть положительным числом."
         )
@@ -137,15 +118,9 @@ def get_owner_id() -> int:
 # TELEGRAM COMMANDS
 # ============================================================================
 
-
-async def configure_bot_commands(bot: Bot) -> None:
-    """
-    Устанавливает стандартное меню команд Telegram.
-
-    Здесь находятся только основные пользовательские команды.
-    Расширенные команды будут обрабатываться handlers.py.
-    """
-
+async def configure_bot_commands(
+    bot: Bot,
+) -> None:
     default_commands = [
         BotCommand(
             command="start",
@@ -153,50 +128,23 @@ async def configure_bot_commands(bot: Bot) -> None:
         ),
         BotCommand(
             command="help",
-            description="Помощь и список возможностей",
+            description="Помощь",
         ),
         BotCommand(
             command="profile",
-            description="Открыть свой профиль",
+            description="Профиль",
         ),
         BotCommand(
             command="stats",
-            description="Посмотреть статистику",
+            description="Статистика",
         ),
         BotCommand(
             command="balance",
-            description="Баланс арахиса",
+            description="Баланс",
         ),
         BotCommand(
             command="games",
-            description="Мини-игры",
-        ),
-        BotCommand(
-            command="bonus",
-            description="Получить ежедневный бонус",
-        ),
-        BotCommand(
-            command="top",
-            description="Таблица лидеров",
-        ),
-    ]
-
-    group_commands = [
-        BotCommand(
-            command="profile",
-            description="Профиль игрока",
-        ),
-        BotCommand(
-            command="stats",
-            description="Статистика игрока",
-        ),
-        BotCommand(
-            command="balance",
-            description="Баланс арахиса",
-        ),
-        BotCommand(
-            command="games",
-            description="Мини-игры",
+            description="Игры",
         ),
         BotCommand(
             command="bonus",
@@ -204,7 +152,58 @@ async def configure_bot_commands(bot: Bot) -> None:
         ),
         BotCommand(
             command="top",
-            description="Таблица лидеров",
+            description="Рейтинги",
+        ),
+        BotCommand(
+            command="battlepass",
+            description="Battle Pass",
+        ),
+        BotCommand(
+            command="tag",
+            description="Мои теги",
+        ),
+        BotCommand(
+            command="inventory",
+            description="Инвентарь",
+        ),
+    ]
+
+    group_commands = [
+        BotCommand(
+            command="profile",
+            description="Профиль",
+        ),
+        BotCommand(
+            command="stats",
+            description="Статистика",
+        ),
+        BotCommand(
+            command="balance",
+            description="Баланс",
+        ),
+        BotCommand(
+            command="games",
+            description="Игры",
+        ),
+        BotCommand(
+            command="bonus",
+            description="Ежедневный бонус",
+        ),
+        BotCommand(
+            command="top",
+            description="Рейтинги",
+        ),
+        BotCommand(
+            command="battlepass",
+            description="Battle Pass",
+        ),
+        BotCommand(
+            command="tag",
+            description="Мои теги",
+        ),
+        BotCommand(
+            command="inventory",
+            description="Инвентарь",
         ),
         BotCommand(
             command="help",
@@ -222,22 +221,25 @@ async def configure_bot_commands(bot: Bot) -> None:
         scope=BotCommandScopeAllGroupChats(),
     )
 
-    logger.info("Меню команд Telegram настроено.")
+    logger.info(
+        "Меню команд Telegram настроено."
+    )
 
 
 # ============================================================================
 # BOT INFORMATION
 # ============================================================================
 
-
-async def log_bot_information(bot: Bot) -> None:
-    """
-    Получает информацию о боте и выводит её в лог.
-    """
-
+async def log_bot_information(
+    bot: Bot,
+) -> None:
     me = await bot.get_me()
 
-    username = f"@{me.username}" if me.username else "без username"
+    username = (
+        f"@{me.username}"
+        if me.username
+        else "без username"
+    )
 
     logger.info(
         "Telegram-бот авторизован: %s (%s), ID=%s",
@@ -247,38 +249,33 @@ async def log_bot_information(bot: Bot) -> None:
     )
 
     logger.info(
-        "%s v%s успешно подготовлен к запуску.",
+        "%s v%s подготовлен к запуску.",
         APP_NAME,
         APP_VERSION,
     )
 
 
 # ============================================================================
-# APPLICATION
+# DISPATCHER
 # ============================================================================
 
-
 async def create_dispatcher() -> Dispatcher:
-    """
-    Создаёт Dispatcher и регистрирует все обработчики.
-
-    Вся Telegram-логика находится в handlers.py.
-    """
-
     dispatcher = Dispatcher()
 
     register_handlers(dispatcher)
 
-    logger.info("Telegram-хендлеры зарегистрированы.")
+    logger.info(
+        "Telegram-хендлеры зарегистрированы."
+    )
 
     return dispatcher
 
 
-async def run_bot() -> None:
-    """
-    Основной жизненный цикл приложения.
-    """
+# ============================================================================
+# APPLICATION
+# ============================================================================
 
+async def run_bot() -> None:
     token = get_bot_token()
     owner_id = get_owner_id()
 
@@ -294,10 +291,6 @@ async def run_bot() -> None:
             owner_id,
         )
 
-    # ------------------------------------------------------------------------
-    # БОТ
-    # ------------------------------------------------------------------------
-
     bot = Bot(
         token=token,
         default=DefaultBotProperties(
@@ -305,44 +298,47 @@ async def run_bot() -> None:
         ),
     )
 
-    # ------------------------------------------------------------------------
-    # DISPATCHER
-    # ------------------------------------------------------------------------
-
     dispatcher = await create_dispatcher()
 
-    # ------------------------------------------------------------------------
-    # ИНИЦИАЛИЗАЦИЯ ПРИЛОЖЕНИЯ
-    # ------------------------------------------------------------------------
-
-    await initialize_application()
-
-    # ------------------------------------------------------------------------
-    # БАЗА ДАННЫХ
-    # ------------------------------------------------------------------------
-
-    await initialize_database()
-
-    # ------------------------------------------------------------------------
-    # TELEGRAM
-    # ------------------------------------------------------------------------
-
-    await log_bot_information(bot)
-    await configure_bot_commands(bot)
-
-    logger.info("База данных успешно инициализирована.")
-    logger.info("Приложение готово.")
-
     try:
-        # Удаляем старые необработанные обновления Telegram.
-        #
-        # Это важно после перезапуска: бот не будет внезапно обрабатывать
-        # сообщения/команды, которые накопились во время его выключения.
+        # --------------------------------------------------------------------
+        # APPLICATION
+        # --------------------------------------------------------------------
+
+        await initialize_application()
+
+        # --------------------------------------------------------------------
+        # DATABASE
+        # --------------------------------------------------------------------
+
+        await initialize_database()
+
+        # --------------------------------------------------------------------
+        # TELEGRAM
+        # --------------------------------------------------------------------
+
+        await log_bot_information(bot)
+        await configure_bot_commands(bot)
+
+        logger.info(
+            "База данных успешно инициализирована."
+        )
+
+        logger.info(
+            "Приложение готово."
+        )
+
+        # --------------------------------------------------------------------
+        # POLLING
+        # --------------------------------------------------------------------
+
         await bot.delete_webhook(
             drop_pending_updates=True,
         )
 
-        logger.info("Запуск long polling...")
+        logger.info(
+            "Запуск long polling..."
+        )
 
         await dispatcher.start_polling(
             bot,
@@ -357,7 +353,9 @@ async def run_bot() -> None:
         raise
 
     except asyncio.CancelledError:
-        logger.info("Получена команда остановки приложения.")
+        logger.info(
+            "Получена команда остановки приложения."
+        )
         raise
 
     except Exception:
@@ -367,11 +365,9 @@ async def run_bot() -> None:
         raise
 
     finally:
-        # --------------------------------------------------------------------
-        # ЗАКРЫТИЕ РЕСУРСОВ
-        # --------------------------------------------------------------------
-
-        logger.info("Остановка приложения...")
+        logger.info(
+            "Остановка приложения..."
+        )
 
         with suppress(Exception):
             await close_application()
@@ -382,24 +378,20 @@ async def run_bot() -> None:
         with suppress(Exception):
             await bot.session.close()
 
-        logger.info("Все ресурсы закрыты.")
+        logger.info(
+            "Все ресурсы закрыты."
+        )
 
 
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
 
-
 def main() -> None:
-    """
-    Синхронная точка входа.
-
-    Запуск:
-        python bot.py
-    """
-
     try:
-        asyncio.run(run_bot())
+        asyncio.run(
+            run_bot()
+        )
 
     except KeyboardInterrupt:
         logger.info(
