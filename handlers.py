@@ -7,6 +7,7 @@ handlers.py — Telegram handlers.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from html import escape
 from typing import Optional
 
@@ -14,15 +15,18 @@ from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from core import (
+    BATTLE_PASS_MAX_LEVEL,
+    BATTLE_PASS_REWARDS,
+    get_adult_rp_action,
+    get_rp_action_by_alias,
 )
 
 from database import (
     AsyncSessionLocal,
+    User,
     get_or_create_chat,
     get_or_create_member,
     get_or_create_user,
@@ -30,45 +34,53 @@ from database import (
 
 from services import (
     ServiceResult,
+    add_warning,
+    admin_give_money,
+    admin_set_balance,
+    admin_set_level,
+    admin_take_money,
     balance_user,
     claim_daily_bonus,
-    create_game,
+    create_giveaway,
     format_balance,
     format_inventory,
+    format_other_profile,
     format_profile,
     format_stats,
     get_game_list,
     get_leaderboard,
+    get_tag_keyboard,
+    get_warnings,
     handle_message,
-    play_coinflip,
-    play_dice,
-    play_roulette,
-    play_slots,
-    play_guess,
-    play_telegram_dice_game,
-    start_tictactoe,
-    tictactoe_move,
-    set_profile_nick,
-    set_profile_tag,
-    perform_rp,
+    join_giveaway,
     moderate_ban,
     moderate_kick,
     moderate_mute,
-    moderate_unmute,
     moderate_unban,
-    add_warning,
-    remove_warning,
-    get_warnings,
-    purge_messages,
-    transfer_money,
-    admin_give_money,
-    admin_take_money,
-    admin_set_level,
-    admin_set_balance,
-    get_tag_keyboard,
-    select_tag,
+    moderate_unmute,
     open_case,
+    perform_adult_rp,
+    perform_rp,
+    play_basketball,
+    play_coinflip,
+    play_dice,
+    play_football,
+    play_guess,
+    play_roulette,
+    play_slots,
+    purge_messages,
+    remove_warning,
     rob_user,
+    select_tag,
+    set_moderation_permission,
+    set_profile_nick,
+    set_profile_tag,
+    start_tictactoe,
+    tictactoe_move,
+    transfer_money,
+    assign_staff_role,
+    remove_staff_role,
+    finish_giveaway,
 )
 
 logger = logging.getLogger("EzzzyGameBot.handlers")
@@ -103,6 +115,9 @@ async def reply(
     text: str,
     **kwargs,
 ) -> Optional[Message]:
+    if not text:
+        return None
+
     try:
         return await message.answer(text, **kwargs)
     except TelegramForbiddenError:
@@ -111,7 +126,10 @@ async def reply(
             message.chat.id,
         )
     except TelegramBadRequest:
-        logger.exception("Telegram отклонил сообщение.")
+        logger.exception(
+            "Telegram отклонил сообщение chat_id=%s",
+            message.chat.id,
+        )
 
     return None
 
@@ -209,6 +227,48 @@ def back_keyboard() -> InlineKeyboardMarkup:
 
 
 # ============================================================================
+# PROFILE TARGET
+# ============================================================================
+
+
+async def resolve_user_id(
+    message: Message,
+    command: Optional[CommandObject] = None,
+) -> Optional[int]:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+
+    args = (command.args if command else "") or ""
+    args = args.strip()
+
+    if not args:
+        return message.from_user.id if message.from_user else None
+
+    first = args.split()[0]
+
+    parsed = parse_integer(first)
+
+    if parsed is not None:
+        return parsed
+
+    username = first.lstrip("@").lower()
+
+    if not username:
+        return None
+
+    async with AsyncSessionLocal() as session:
+        from sqlalchemy import select
+
+        result = await session.execute(
+            select(User.id).where(
+                User.username.ilike(username)
+            )
+        )
+
+        return result.scalar_one_or_none()
+
+
+# ============================================================================
 # START / HELP
 # ============================================================================
 
@@ -257,7 +317,7 @@ async def cmd_help(message: Message) -> None:
             "/dice 100\n"
             "/slots 100\n"
             "/roulette 100 red\n"
-            "/guess 100 50\n"
+            "/guess 100 5\n"
             "/football 100\n"
             "/basketball 100\n"
             "/ttt\n\n"
@@ -266,8 +326,7 @@ async def cmd_help(message: Message) -> None:
             "/rob ответом\n\n"
             "<b>🎭 RP</b>\n"
             "обычные RP-команды работают текстом\n"
-            "18+ RP-команды работают текстом\n"
-            "или через reply\n\n"
+            "18+ RP-команды работают текстом\n\n"
             "<b>🛡 Модерация</b>\n"
             "/warn\n"
             "/unwarn\n"
@@ -279,6 +338,13 @@ async def cmd_help(message: Message) -> None:
             "/kick\n"
             "/purge\n"
             "/setnick\n"
+            "/setrole\n"
+            "/delrole\n"
+            "/setperm\n\n"
+            "<b>🎁 Розыгрыши</b>\n"
+            "/giveaway\n"
+            "/giveaway_join ID\n"
+            "/giveaway_finish ID"
         ),
     )
 
@@ -286,46 +352,6 @@ async def cmd_help(message: Message) -> None:
 # ============================================================================
 # PROFILE
 # ============================================================================
-
-
-async def _resolve_profile_target(
-    message: Message,
-    command: Optional[CommandObject] = None,
-) -> Optional[int]:
-    if message.reply_to_message and message.reply_to_message.from_user:
-        return message.reply_to_message.from_user.id
-
-    args = (command.args if command else "") or ""
-    args = args.strip()
-
-    if not args:
-        return message.from_user.id if message.from_user else None
-
-    username = args.split()[0].lstrip("@").lower()
-
-    if username:
-        async with AsyncSessionLocal() as session:
-            from sqlalchemy import select
-
-            from database import User
-
-            result = await session.execute(
-                select(User.id).where(
-                    User.username.ilike(username)
-                )
-            )
-
-            user_id = result.scalar_one_or_none()
-
-            if user_id is not None:
-                return user_id
-
-    parsed = parse_integer(args.split()[0])
-
-    if parsed is not None:
-        return parsed
-
-    return None
 
 
 @router.message(Command("profile"))
@@ -338,7 +364,7 @@ async def cmd_profile(
 
     await get_or_prepare_member(message)
 
-    target_id = await _resolve_profile_target(
+    target_id = await resolve_user_id(
         message,
         command,
     )
@@ -351,11 +377,18 @@ async def cmd_profile(
         return
 
     async with AsyncSessionLocal() as session:
-        text = await format_profile(
-            session=session,
-            chat_id=message.chat.id,
-            user_id=target_id,
-        )
+        if target_id == message.from_user.id:
+            text = await format_profile(
+                session=session,
+                chat_id=message.chat.id,
+                user_id=target_id,
+            )
+        else:
+            text = await format_other_profile(
+                session=session,
+                chat_id=message.chat.id,
+                user_id=target_id,
+            )
 
     await reply(message, text)
 
@@ -367,11 +400,16 @@ async def cmd_stats(message: Message) -> None:
 
     await get_or_prepare_member(message)
 
+    target_id = await resolve_user_id(message)
+
+    if target_id is None:
+        return
+
     async with AsyncSessionLocal() as session:
         text = await format_stats(
             session=session,
             chat_id=message.chat.id,
-            user_id=message.from_user.id,
+            user_id=target_id,
         )
 
     await reply(message, text)
@@ -432,7 +470,7 @@ async def cmd_tag(message: Message) -> None:
         message,
         (
             "🏷 <b>Твои теги</b>\n\n"
-            "Выбери тег кнопкой ниже."
+            "Выбери полученный тег:"
         ),
         reply_markup=keyboard,
     )
@@ -440,12 +478,13 @@ async def cmd_tag(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("tagselect:"))
 async def callback_tag_select(callback: CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
+    if not callback.message or not callback.from_user:
         await callback.answer()
         return
 
-    raw_id = callback.data.split(":", 1)[1]
-    tag_id = parse_integer(raw_id)
+    tag_id = parse_integer(
+        callback.data.split(":", 1)[1]
+    )
 
     if tag_id is None:
         await callback.answer(
@@ -465,19 +504,18 @@ async def callback_tag_select(callback: CallbackQuery) -> None:
         if result.success:
             await session.commit()
 
+        keyboard = await get_tag_keyboard(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
     await callback.answer(
         result.answer or result.message,
         show_alert=result.show_alert,
     )
 
     if result.success:
-        async with AsyncSessionLocal() as session:
-            keyboard = await get_tag_keyboard(
-                session=session,
-                chat_id=callback.message.chat.id,
-                user_id=callback.from_user.id,
-            )
-
         try:
             await callback.message.edit_reply_markup(
                 reply_markup=keyboard,
@@ -494,15 +532,43 @@ async def cmd_battlepass(message: Message) -> None:
     await get_or_prepare_member(message)
 
     async with AsyncSessionLocal() as session:
-        from services import format_battle_pass
-
-        result = await format_battle_pass(
+        member = await get_or_create_member(
             session=session,
             chat_id=message.chat.id,
             user_id=message.from_user.id,
         )
 
-    await reply(message, result)
+        level = min(
+            BATTLE_PASS_MAX_LEVEL,
+            max(1, member.battle_pass_level),
+        )
+
+        current_xp = member.battle_pass_xp
+        level_xp = current_xp % 100
+        remaining = 0 if level >= BATTLE_PASS_MAX_LEVEL else 100 - level_xp
+
+        reward_text = "—"
+
+        reward = BATTLE_PASS_REWARDS.get(level)
+
+        if reward is not None:
+            reward_text = str(
+                getattr(reward, "description", None)
+                or getattr(reward, "name", None)
+                or getattr(reward, "reward_type", None)
+                or reward
+            )
+
+    await reply(
+        message,
+        (
+            "<b>🏆 Battle Pass</b>\n\n"
+            f"Уровень: <b>{level}/{BATTLE_PASS_MAX_LEVEL}</b>\n"
+            f"XP сезона: <b>{current_xp}</b>\n"
+            f"До следующего уровня: <b>{remaining}</b>\n\n"
+            f"🎁 Награда текущего уровня:\n{escape(reward_text)}"
+        ),
+    )
 
 
 @router.message(Command("top"))
@@ -576,17 +642,6 @@ async def cmd_pay(
     target = message.reply_to_message.from_user
 
     if not target:
-        await reply(
-            message,
-            "❌ Не удалось определить получателя.",
-        )
-        return
-
-    if target.id == message.from_user.id:
-        await reply(
-            message,
-            "😐 Самому себе переводить нельзя.",
-        )
         return
 
     async with AsyncSessionLocal() as session:
@@ -609,24 +664,16 @@ async def cmd_rob(message: Message) -> None:
     if not message.from_user:
         return
 
-    target = (
-        message.reply_to_message.from_user
-        if message.reply_to_message
-        else None
-    )
-
-    if target is None:
+    if not message.reply_to_message:
         await reply(
             message,
             "🥷 Используй /rob ответом на сообщение цели.",
         )
         return
 
-    if target.id == message.from_user.id:
-        await reply(
-            message,
-            "😐 Себя ограбить нельзя.",
-        )
+    target = message.reply_to_message.from_user
+
+    if not target:
         return
 
     async with AsyncSessionLocal() as session:
@@ -812,14 +859,14 @@ async def cmd_guess(
     if len(args) < 2:
         await reply(
             message,
-            "🔢 Пример: <code>/guess 100 50</code>",
+            "🔢 Пример: <code>/guess 100 5</code>",
         )
         return
 
     bet = parse_integer(args[0])
-    guess = parse_integer(args[1])
+    number = parse_integer(args[1])
 
-    if bet is None or guess is None:
+    if bet is None or number is None:
         await reply(
             message,
             "❌ Некорректные параметры.",
@@ -832,7 +879,7 @@ async def cmd_guess(
             chat_id=message.chat.id,
             user_id=message.from_user.id,
             bet=bet,
-            guess=guess,
+            number=number,
         )
 
         if result.success:
@@ -859,11 +906,10 @@ async def cmd_football(
         return
 
     async with AsyncSessionLocal() as session:
-        result = await play_telegram_dice_game(
+        result = await play_football(
             session=session,
             chat_id=message.chat.id,
             user_id=message.from_user.id,
-            game_type="football",
             bet=bet,
         )
 
@@ -891,11 +937,10 @@ async def cmd_basketball(
         return
 
     async with AsyncSessionLocal() as session:
-        result = await play_telegram_dice_game(
+        result = await play_basketball(
             session=session,
             chat_id=message.chat.id,
             user_id=message.from_user.id,
-            game_type="basketball",
             bet=bet,
         )
 
@@ -903,11 +948,6 @@ async def cmd_basketball(
             await session.commit()
 
     await reply(message, result.message)
-
-
-# ============================================================================
-# GAME CALLBACKS
-# ============================================================================
 
 
 @router.callback_query(F.data == "games:menu")
@@ -932,7 +972,7 @@ async def callback_games_menu(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("game:"))
 async def callback_game(callback: CallbackQuery) -> None:
-    if not callback.message or not callback.from_user:
+    if not callback.message:
         await callback.answer()
         return
 
@@ -949,23 +989,23 @@ async def callback_game(callback: CallbackQuery) -> None:
         "tictactoe": "⭕❌ Крестики-нолики",
     }
 
+    examples = {
+        "coinflip": "/coinflip 100",
+        "dice": "/dice 100",
+        "slots": "/slots 100",
+        "roulette": "/roulette 100 red",
+        "guess": "/guess 100 5",
+        "football": "/football 100",
+        "basketball": "/basketball 100",
+        "tictactoe": "/ttt",
+    }
+
     if game_type not in labels:
         await callback.answer(
             "Неизвестная игра.",
             show_alert=True,
         )
         return
-
-    examples = {
-        "coinflip": "/coinflip 100",
-        "dice": "/dice 100",
-        "slots": "/slots 100",
-        "roulette": "/roulette 100 red",
-        "guess": "/guess 100 50",
-        "football": "/football 100",
-        "basketball": "/basketball 100",
-        "tictactoe": "/ttt",
-    }
 
     await callback.answer()
 
@@ -991,11 +1031,22 @@ async def cmd_ttt(message: Message) -> None:
     if not message.from_user:
         return
 
+    args = (message.text or "").split()
+
+    bet = 10
+
+    if len(args) > 1:
+        parsed = parse_integer(args[1])
+
+        if parsed is not None:
+            bet = parsed
+
     async with AsyncSessionLocal() as session:
         result = await start_tictactoe(
             session=session,
             chat_id=message.chat.id,
             user_id=message.from_user.id,
+            bet=bet,
         )
 
         if result.success:
@@ -1084,6 +1135,11 @@ def _extract_rp_target(
 
             return target_user_id, target_name
 
+    if target_text.startswith("@"):
+        target_name = escape(
+            target_text.split()[0]
+        )
+
     if message.entities:
         for entity in message.entities:
             if entity.type == "text_mention" and entity.user:
@@ -1093,22 +1149,97 @@ def _extract_rp_target(
                 )
                 return target_user_id, target_name
 
-            if entity.type == "mention":
-                offset = entity.offset
-                length = entity.length
-                raw_text = message.text or ""
-                mention = raw_text[offset:offset + length]
-
-                if mention.startswith("@"):
-                    target_name = escape(mention)
-                    return target_user_id, target_name
-
-    if target_text.startswith("@"):
-        target_name = escape(
-            target_text.split()[0]
-        )
-
     return target_user_id, target_name
+
+
+def parse_rp_text(
+    message: Message,
+) -> tuple[str, str]:
+    text = (message.text or "").strip()
+
+    if text.startswith("/") or text.startswith("!"):
+        text = text[1:].strip()
+
+    parts = text.split()
+
+    if not parts:
+        return "", ""
+
+    normalized = " ".join(
+        part.lower()
+        for part in parts
+    )
+
+    words = normalized.split()
+
+    multiword = {
+        "дать пять",
+        "дать подзатыльник",
+        "кинуть тапок",
+    }
+
+    if len(words) >= 2:
+        candidate = f"{words[0]} {words[1]}"
+
+        if candidate in multiword:
+            return (
+                candidate,
+                " ".join(parts[2:]),
+            )
+
+    return (
+        words[0],
+        " ".join(parts[1:]),
+    )
+
+
+async def execute_rp(
+    message: Message,
+) -> Optional[ServiceResult]:
+    if not message.from_user or not is_group(message):
+        return None
+
+    action, target_text = parse_rp_text(message)
+
+    if not action:
+        return None
+
+    target_user_id, target_name = _extract_rp_target(
+        message,
+        target_text,
+    )
+
+    async with AsyncSessionLocal() as session:
+        adult_action = get_adult_rp_action(action)
+
+        if adult_action is not None:
+            result = await perform_adult_rp(
+                session=session,
+                chat_id=message.chat.id,
+                actor_id=message.from_user.id,
+                action=action,
+                target_id=target_user_id,
+                target_name=target_name,
+            )
+        else:
+            normal_action = get_rp_action_by_alias(action)
+
+            if normal_action is None:
+                return None
+
+            result = await perform_rp(
+                session=session,
+                chat_id=message.chat.id,
+                actor_id=message.from_user.id,
+                action=action,
+                target_id=target_user_id,
+                target_name=target_name,
+            )
+
+        if result.success:
+            await session.commit()
+
+        return result
 
 
 @router.message(
@@ -1120,59 +1251,13 @@ def _extract_rp_target(
     )
 )
 async def rp_handler(message: Message) -> None:
-    if not message.from_user or not is_group(message):
-        return
+    result = await execute_rp(message)
 
-    text = (message.text or "").strip()
-
-    if text.startswith("/") or text.startswith("!"):
-        text = text[1:]
-
-    parts = text.split()
-
-    if not parts:
-        return
-
-    multiword_actions = {
-        "дать пять",
-        "дать подзатыльник",
-        "кинуть тапок",
-    }
-
-    action = ""
-    target_text = ""
-
-    if len(parts) >= 2:
-        candidate = f"{parts[0].lower()} {parts[1].lower()}"
-
-        if candidate in multiword_actions:
-            action = candidate
-            target_text = " ".join(parts[2:])
-        else:
-            action = parts[0].lower()
-            target_text = " ".join(parts[1:])
-    else:
-        action = parts[0].lower()
-
-    target_user_id, target_name = _extract_rp_target(
-        message,
-        target_text,
-    )
-
-    async with AsyncSessionLocal() as session:
-        result = await perform_rp(
-            session=session,
-            chat_id=message.chat.id,
-            actor_id=message.from_user.id,
-            action=action,
-            target_id=target_user_id,
-            target_name=target_name,
+    if result is not None:
+        await reply(
+            message,
+            result.message,
         )
-
-        if result.success:
-            await session.commit()
-
-    await reply(message, result.message)
 
 
 # ============================================================================
@@ -1237,6 +1322,16 @@ async def cmd_settag(
 # ============================================================================
 
 
+def reply_target_id(message: Message) -> Optional[int]:
+    if (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+    ):
+        return message.reply_to_message.from_user.id
+
+    return None
+
+
 @router.message(Command("warn"))
 async def cmd_warn(
     message: Message,
@@ -1245,16 +1340,13 @@ async def cmd_warn(
     if not message.from_user:
         return
 
-    if not message.reply_to_message:
+    target_id = reply_target_id(message)
+
+    if target_id is None:
         await reply(
             message,
             "⚠️ Используй /warn ответом на сообщение.",
         )
-        return
-
-    target = message.reply_to_message.from_user
-
-    if not target:
         return
 
     reason = (command.args or "").strip()
@@ -1263,7 +1355,7 @@ async def cmd_warn(
         result = await add_warning(
             session=session,
             chat_id=message.chat.id,
-            target_user_id=target.id,
+            target_user_id=target_id,
             moderator_id=message.from_user.id,
             reason=reason,
         )
@@ -1280,10 +1372,8 @@ async def cmd_warnings(message: Message) -> None:
         return
 
     target_id = (
-        message.reply_to_message.from_user.id
-        if message.reply_to_message
-        and message.reply_to_message.from_user
-        else message.from_user.id
+        reply_target_id(message)
+        or message.from_user.id
     )
 
     async with AsyncSessionLocal() as session:
@@ -1301,23 +1391,20 @@ async def cmd_unwarn(message: Message) -> None:
     if not message.from_user:
         return
 
-    if not message.reply_to_message:
+    target_id = reply_target_id(message)
+
+    if target_id is None:
         await reply(
             message,
             "Используй /unwarn ответом на сообщение.",
         )
         return
 
-    target = message.reply_to_message.from_user
-
-    if not target:
-        return
-
     async with AsyncSessionLocal() as session:
         result = await remove_warning(
             session=session,
             chat_id=message.chat.id,
-            user_id=target.id,
+            user_id=target_id,
             moderator_id=message.from_user.id,
         )
 
@@ -1332,19 +1419,20 @@ async def cmd_mute(
     message: Message,
     command: CommandObject,
 ) -> None:
-    if not message.from_user or not message.reply_to_message:
+    if not message.from_user:
+        return
+
+    target_id = reply_target_id(message)
+
+    if target_id is None:
         await reply(
             message,
             "🔇 Используй /mute ответом на сообщение.",
         )
         return
 
-    target = message.reply_to_message.from_user
-
-    if not target:
-        return
-
     duration = 60
+
     args = (command.args or "").split()
 
     if args:
@@ -1358,7 +1446,7 @@ async def cmd_mute(
             session=session,
             bot=message.bot,
             chat_id=message.chat.id,
-            target_user_id=target.id,
+            target_user_id=target_id,
             moderator_id=message.from_user.id,
             duration_minutes=duration,
         )
@@ -1371,16 +1459,16 @@ async def cmd_mute(
 
 @router.message(Command("unmute"))
 async def cmd_unmute(message: Message) -> None:
-    if not message.from_user or not message.reply_to_message:
+    if not message.from_user:
+        return
+
+    target_id = reply_target_id(message)
+
+    if target_id is None:
         await reply(
             message,
             "Используй /unmute ответом на сообщение.",
         )
-        return
-
-    target = message.reply_to_message.from_user
-
-    if not target:
         return
 
     async with AsyncSessionLocal() as session:
@@ -1388,7 +1476,7 @@ async def cmd_unmute(message: Message) -> None:
             session=session,
             bot=message.bot,
             chat_id=message.chat.id,
-            target_user_id=target.id,
+            target_user_id=target_id,
             moderator_id=message.from_user.id,
         )
 
@@ -1403,16 +1491,16 @@ async def cmd_ban(
     message: Message,
     command: CommandObject,
 ) -> None:
-    if not message.from_user or not message.reply_to_message:
+    if not message.from_user:
+        return
+
+    target_id = reply_target_id(message)
+
+    if target_id is None:
         await reply(
             message,
             "Используй /ban ответом на сообщение.",
         )
-        return
-
-    target = message.reply_to_message.from_user
-
-    if not target:
         return
 
     reason = (command.args or "").strip()
@@ -1422,7 +1510,7 @@ async def cmd_ban(
             session=session,
             bot=message.bot,
             chat_id=message.chat.id,
-            target_user_id=target.id,
+            target_user_id=target_id,
             moderator_id=message.from_user.id,
             reason=reason,
         )
@@ -1472,16 +1560,16 @@ async def cmd_kick(
     message: Message,
     command: CommandObject,
 ) -> None:
-    if not message.from_user or not message.reply_to_message:
+    if not message.from_user:
+        return
+
+    target_id = reply_target_id(message)
+
+    if target_id is None:
         await reply(
             message,
             "Используй /kick ответом на сообщение.",
         )
-        return
-
-    target = message.reply_to_message.from_user
-
-    if not target:
         return
 
     reason = (command.args or "").strip()
@@ -1491,7 +1579,7 @@ async def cmd_kick(
             session=session,
             bot=message.bot,
             chat_id=message.chat.id,
-            target_user_id=target.id,
+            target_user_id=target_id,
             moderator_id=message.from_user.id,
             reason=reason,
         )
@@ -1522,13 +1610,136 @@ async def cmd_purge(
         )
         return
 
-    async with AsyncSessionLocal() as session:
-        result = await purge_messages(
-            bot=message.bot,
-            chat_id=message.chat.id,
-            moderator_id=message.from_user.id,
-            count=amount,
+    result = await purge_messages(
+        bot=message.bot,
+        chat_id=message.chat.id,
+        moderator_id=message.from_user.id,
+        count=amount,
+    )
+
+    await reply(message, result.message)
+
+
+# ============================================================================
+# STAFF ROLES / PERMISSIONS
+# ============================================================================
+
+
+@router.message(Command("setrole"))
+async def cmd_setrole(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    if not message.from_user:
+        return
+
+    target_id = reply_target_id(message)
+
+    args = (command.args or "").split()
+
+    if target_id is None and args:
+        target_id = parse_integer(args[0])
+        args = args[1:]
+
+    if target_id is None or not args:
+        await reply(
+            message,
+            (
+                "Использование:\n"
+                "/setrole <role> ответом\n"
+                "или /setrole USER_ID <role>\n\n"
+                "Роли: head_admin, admin, moderator"
+            ),
         )
+        return
+
+    role = args[0].lower()
+
+    async with AsyncSessionLocal() as session:
+        result = await assign_staff_role(
+            session=session,
+            chat_id=message.chat.id,
+            actor_id=message.from_user.id,
+            target_id=target_id,
+            role=role,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(message, result.message)
+
+
+@router.message(Command("delrole"))
+async def cmd_delrole(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    target_id = reply_target_id(message)
+
+    if target_id is None:
+        target_id = parse_integer(
+            (message.text or "").split(maxsplit=1)[1]
+            if len((message.text or "").split()) > 1
+            else ""
+        )
+
+    if target_id is None:
+        await reply(
+            message,
+            "Используй /delrole ответом или укажи USER_ID.",
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await remove_staff_role(
+            session=session,
+            chat_id=message.chat.id,
+            actor_id=message.from_user.id,
+            target_id=target_id,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(message, result.message)
+
+
+@router.message(Command("setperm"))
+async def cmd_setperm(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    if not message.from_user:
+        return
+
+    args = (command.args or "").split()
+
+    if len(args) != 2:
+        await reply(
+            message,
+            (
+                "Пример:\n"
+                "<code>/setperm warn staff</code>\n\n"
+                "Доступ: staff, admin, head_admin"
+            ),
+        )
+        return
+
+    command_name = args[0]
+    scope = args[1]
+
+    async with AsyncSessionLocal() as session:
+        result = await set_moderation_permission(
+            session=session,
+            chat_id=message.chat.id,
+            actor_id=message.from_user.id,
+            command=command_name,
+            scope=scope,
+        )
+
+        if result.success:
+            await session.commit()
 
     await reply(message, result.message)
 
@@ -1731,21 +1942,178 @@ async def callback_case(callback: CallbackQuery) -> None:
             await session.commit()
 
     await callback.answer(
-        result.answer or "",
+        result.answer or result.message,
         show_alert=result.show_alert,
     )
 
     if callback.message:
-        try:
-            await callback.message.answer(
-                result.message,
-            )
-        except TelegramBadRequest:
-            pass
+        await reply(
+            callback.message,
+            result.message,
+        )
 
 
 # ============================================================================
-# ORDINARY MESSAGE / XP / ADULT RP
+# GIVEAWAYS
+# ============================================================================
+
+
+@router.message(Command("giveaway"))
+async def cmd_giveaway(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    if not message.from_user:
+        return
+
+    args = (command.args or "").split(maxsplit=3)
+
+    if len(args) < 3:
+        await reply(
+            message,
+            (
+                "Формат:\n"
+                "<code>/giveaway peanuts 100 60</code>\n"
+                "<code>/giveaway item ITEM_CODE 60</code>\n"
+                "<code>/giveaway external описание 60</code>\n\n"
+                "Последнее число — длительность в минутах."
+            ),
+        )
+        return
+
+    prize_type = args[0].lower()
+
+    try:
+        duration_minutes = int(args[-1])
+    except ValueError:
+        await reply(
+            message,
+            "❌ Длительность должна быть числом минут.",
+        )
+        return
+
+    if duration_minutes <= 0:
+        await reply(
+            message,
+            "❌ Длительность должна быть больше 0.",
+        )
+        return
+
+    prize_amount = None
+    prize_item_code = None
+    prize_description = None
+
+    if prize_type == "peanuts":
+        prize_amount = parse_integer(args[1])
+
+        if prize_amount is None or prize_amount <= 0:
+            await reply(
+                message,
+                "❌ Укажи положительное количество арахиса.",
+            )
+            return
+
+    elif prize_type == "item":
+        prize_item_code = args[1]
+
+    elif prize_type == "external":
+        prize_description = " ".join(args[1:-1]).strip()
+
+        if not prize_description:
+            await reply(
+                message,
+                "❌ Укажи описание внешнего приза.",
+            )
+            return
+
+    else:
+        await reply(
+            message,
+            "❌ Тип приза: peanuts, item или external.",
+        )
+        return
+
+    ends_at = datetime.utcnow() + timedelta(
+        minutes=duration_minutes
+    )
+
+    async with AsyncSessionLocal() as session:
+        result = await create_giveaway(
+            session=session,
+            chat_id=message.chat.id,
+            creator_id=message.from_user.id,
+            prize_type=prize_type,
+            ends_at=ends_at,
+            prize_amount=prize_amount,
+            prize_item_code=prize_item_code,
+            prize_description=prize_description,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(message, result.message)
+
+
+@router.message(Command("giveaway_join"))
+async def cmd_giveaway_join(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    if not message.from_user:
+        return
+
+    giveaway_id = parse_integer(command.args)
+
+    if giveaway_id is None:
+        await reply(
+            message,
+            "Пример: <code>/giveaway_join 123</code>",
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await join_giveaway(
+            session=session,
+            giveaway_id=giveaway_id,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(message, result.message)
+
+
+@router.message(Command("giveaway_finish"))
+async def cmd_giveaway_finish(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    giveaway_id = parse_integer(command.args)
+
+    if giveaway_id is None:
+        await reply(
+            message,
+            "Пример: <code>/giveaway_finish 123</code>",
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await finish_giveaway(
+            session=session,
+            giveaway_id=giveaway_id,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(message, result.message)
+
+
+# ============================================================================
+# ORDINARY MESSAGE / XP / RP
 # ============================================================================
 
 
@@ -1765,33 +2133,12 @@ async def ordinary_message(message: Message) -> None:
     if not text:
         return
 
-    # Сначала пробуем распознать RP.
-    # Это позволяет 18+ RP-командам, которые не перечислены
-    # в regexp выше, проходить через тот же perform_rp().
-    target_user_id, target_name = _extract_rp_target(
-        message,
-        text,
-    )
+    result = await execute_rp(message)
 
-    rp_result: Optional[ServiceResult] = None
-
-    async with AsyncSessionLocal() as session:
-        rp_result = await perform_rp(
-            session=session,
-            chat_id=message.chat.id,
-            actor_id=message.from_user.id,
-            action=text,
-            target_id=target_user_id,
-            target_name=target_name,
-        )
-
-        if rp_result.success:
-            await session.commit()
-
-    if rp_result.success:
+    if result is not None:
         await reply(
             message,
-            rp_result.message,
+            result.message,
         )
         return
 
@@ -1831,4 +2178,6 @@ async def global_error_handler(event) -> None:
 
 def register_handlers(dispatcher) -> None:
     dispatcher.include_router(router)
-    logger.info("Основной router зарегистрирован.")
+    logger.info(
+        "Основной router зарегистрирован."
+    )
