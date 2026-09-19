@@ -45,6 +45,7 @@ from services import (
     play_roulette,
     play_slots,
     play_guess,
+    play_telegram_dice_game,
     start_tictactoe,
     tictactoe_move,
     set_profile_nick,
@@ -67,11 +68,17 @@ from services import (
     get_tag_keyboard,
     select_tag,
     open_case,
+    rob_user,
 )
 
 logger = logging.getLogger("EzzzyGameBot.handlers")
 
 router = Router(name="main")
+
+
+# ============================================================================
+# GENERAL
+# ============================================================================
 
 
 def is_group(message: Message) -> bool:
@@ -201,6 +208,11 @@ def back_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+# ============================================================================
+# START / HELP
+# ============================================================================
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     await get_or_prepare_member(message)
@@ -230,6 +242,8 @@ async def cmd_help(message: Message) -> None:
             "<b>📚 Команды Ezzzy</b>\n\n"
             "<b>👤 Профиль</b>\n"
             "/profile\n"
+            "/profile @username\n"
+            "/profile ответом на сообщение\n"
             "/stats\n"
             "/balance\n"
             "/inventory\n"
@@ -244,10 +258,12 @@ async def cmd_help(message: Message) -> None:
             "/slots 100\n"
             "/roulette 100 red\n"
             "/guess 100 50\n"
+            "/football 100\n"
+            "/basketball 100\n"
             "/ttt\n\n"
             "<b>💰 Экономика</b>\n"
-            "/pay 100\n"
-            "/rob\n\n"
+            "/pay 100 ответом\n"
+            "/rob ответом\n\n"
             "<b>🎭 RP</b>\n"
             "обычные RP-команды работают текстом\n"
             "18+ RP-команды работают текстом\n"
@@ -267,18 +283,78 @@ async def cmd_help(message: Message) -> None:
     )
 
 
+# ============================================================================
+# PROFILE
+# ============================================================================
+
+
+async def _resolve_profile_target(
+    message: Message,
+    command: Optional[CommandObject] = None,
+) -> Optional[int]:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+
+    args = (command.args if command else "") or ""
+    args = args.strip()
+
+    if not args:
+        return message.from_user.id if message.from_user else None
+
+    username = args.split()[0].lstrip("@").lower()
+
+    if username:
+        async with AsyncSessionLocal() as session:
+            from sqlalchemy import select
+
+            from database import User
+
+            result = await session.execute(
+                select(User.id).where(
+                    User.username.ilike(username)
+                )
+            )
+
+            user_id = result.scalar_one_or_none()
+
+            if user_id is not None:
+                return user_id
+
+    parsed = parse_integer(args.split()[0])
+
+    if parsed is not None:
+        return parsed
+
+    return None
+
+
 @router.message(Command("profile"))
-async def cmd_profile(message: Message) -> None:
+async def cmd_profile(
+    message: Message,
+    command: CommandObject,
+) -> None:
     if not message.from_user:
         return
 
     await get_or_prepare_member(message)
 
+    target_id = await _resolve_profile_target(
+        message,
+        command,
+    )
+
+    if target_id is None:
+        await reply(
+            message,
+            "❌ Не удалось найти пользователя.",
+        )
+        return
+
     async with AsyncSessionLocal() as session:
         text = await format_profile(
             session=session,
             chat_id=message.chat.id,
-            user_id=message.from_user.id,
+            user_id=target_id,
         )
 
     await reply(message, text)
@@ -467,6 +543,11 @@ async def cmd_bonus(message: Message) -> None:
     await reply(message, result.message)
 
 
+# ============================================================================
+# ECONOMY
+# ============================================================================
+
+
 @router.message(Command("pay"))
 async def cmd_pay(
     message: Message,
@@ -549,8 +630,6 @@ async def cmd_rob(message: Message) -> None:
         return
 
     async with AsyncSessionLocal() as session:
-        from services import rob_user
-
         result = await rob_user(
             session=session,
             chat_id=message.chat.id,
@@ -562,6 +641,11 @@ async def cmd_rob(message: Message) -> None:
             await session.commit()
 
     await reply(message, result.message)
+
+
+# ============================================================================
+# GAMES
+# ============================================================================
 
 
 @router.message(Command("games"))
@@ -728,14 +812,14 @@ async def cmd_guess(
     if len(args) < 2:
         await reply(
             message,
-            "🔢 Формат: <code>/guess 100 50</code>",
+            "🔢 Пример: <code>/guess 100 50</code>",
         )
         return
 
     bet = parse_integer(args[0])
-    number = parse_integer(args[1])
+    guess = parse_integer(args[1])
 
-    if bet is None or number is None:
+    if bet is None or guess is None:
         await reply(
             message,
             "❌ Некорректные параметры.",
@@ -748,163 +832,13 @@ async def cmd_guess(
             chat_id=message.chat.id,
             user_id=message.from_user.id,
             bet=bet,
-            guess=number,
+            guess=guess,
         )
 
         if result.success:
             await session.commit()
 
     await reply(message, result.message)
-
-
-@router.message(Command("ttt"))
-async def cmd_ttt(message: Message) -> None:
-    if not message.from_user:
-        return
-
-    args = (message.text or "").split()
-
-    bet = 0
-
-    if len(args) >= 2:
-        parsed = parse_integer(args[1])
-        if parsed is not None:
-            bet = parsed
-
-    async with AsyncSessionLocal() as session:
-        result = await start_tictactoe(
-            session=session,
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            bet=bet,
-        )
-
-        if result.success:
-            await session.commit()
-
-    await reply(
-        message,
-        result.message,
-        reply_markup=result.keyboard,
-    )
-
-
-@router.callback_query(F.data.startswith("ttt:"))
-async def callback_ttt(callback: CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
-        await callback.answer()
-        return
-
-    parts = callback.data.split(":")
-
-    if len(parts) != 3:
-        await callback.answer(
-            "Некорректный ход.",
-            show_alert=True,
-        )
-        return
-
-    game_id = parse_integer(parts[1])
-    position = parse_integer(parts[2])
-
-    if game_id is None or position is None:
-        await callback.answer(
-            "Некорректный ход.",
-            show_alert=True,
-        )
-        return
-
-    async with AsyncSessionLocal() as session:
-        result = await tictactoe_move(
-            session=session,
-            game_id=game_id,
-            user_id=callback.from_user.id,
-            position=position,
-        )
-
-        if result.success:
-            await session.commit()
-
-    await callback.answer(
-        result.answer or "",
-        show_alert=result.show_alert,
-    )
-
-    try:
-        if result.keyboard is not None:
-            await callback.message.edit_text(
-                result.message,
-                reply_markup=result.keyboard,
-            )
-        else:
-            await callback.message.edit_text(
-                result.message,
-            )
-    except TelegramBadRequest:
-        pass
-
-
-@router.callback_query(F.data.startswith("game:"))
-async def callback_game(callback: CallbackQuery) -> None:
-    if not callback.message or not callback.from_user:
-        await callback.answer()
-        return
-
-    game = callback.data.split(":", 1)[1]
-
-    await callback.answer()
-
-    if game == "coinflip":
-        await callback.message.answer(
-            "🪙 Используй <code>/coinflip ставка</code>."
-        )
-        return
-
-    if game == "dice":
-        await callback.message.answer(
-            "🎲 Используй <code>/dice ставка</code>."
-        )
-        return
-
-    if game == "slots":
-        await callback.message.answer(
-            "🎰 Используй <code>/slots ставка</code>."
-        )
-        return
-
-    if game == "roulette":
-        await callback.message.answer(
-            "🎡 Используй <code>/roulette ставка red</code>."
-        )
-        return
-
-    if game == "guess":
-        await callback.message.answer(
-            "🔢 Используй <code>/guess ставка число</code>."
-        )
-        return
-
-    if game == "football":
-        await callback.message.answer(
-            "⚽ Используй <code>/football ставка</code>."
-        )
-        return
-
-    if game == "basketball":
-        await callback.message.answer(
-            "🏀 Используй <code>/basketball ставка</code>."
-        )
-        return
-
-    if game == "tictactoe":
-        await callback.message.answer(
-            "⭕❌ Используй <code>/ttt</code>."
-        )
-        return
-
-    await callback.message.answer(
-        "❌ Неизвестная игра."
-    )
 
 
 @router.message(Command("football"))
@@ -925,8 +859,6 @@ async def cmd_football(
         return
 
     async with AsyncSessionLocal() as session:
-        from services import play_telegram_dice_game
-
         result = await play_telegram_dice_game(
             session=session,
             chat_id=message.chat.id,
@@ -959,8 +891,6 @@ async def cmd_basketball(
         return
 
     async with AsyncSessionLocal() as session:
-        from services import play_telegram_dice_game
-
         result = await play_telegram_dice_game(
             session=session,
             chat_id=message.chat.id,
@@ -973,6 +903,212 @@ async def cmd_basketball(
             await session.commit()
 
     await reply(message, result.message)
+
+
+# ============================================================================
+# GAME CALLBACKS
+# ============================================================================
+
+
+@router.callback_query(F.data == "games:menu")
+async def callback_games_menu(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+    try:
+        await callback.message.edit_text(
+            (
+                "<b>🎮 Мини-игры</b>\n\n"
+                "Выбери игру:"
+            ),
+            reply_markup=games_keyboard(),
+        )
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith("game:"))
+async def callback_game(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    game_type = callback.data.split(":", 1)[1]
+
+    labels = {
+        "coinflip": "🪙 Монетка",
+        "dice": "🎲 Кубики",
+        "slots": "🎰 Слоты",
+        "roulette": "🎡 Рулетка",
+        "guess": "🔢 Угадай число",
+        "football": "⚽ Футбол",
+        "basketball": "🏀 Баскетбол",
+        "tictactoe": "⭕❌ Крестики-нолики",
+    }
+
+    if game_type not in labels:
+        await callback.answer(
+            "Неизвестная игра.",
+            show_alert=True,
+        )
+        return
+
+    examples = {
+        "coinflip": "/coinflip 100",
+        "dice": "/dice 100",
+        "slots": "/slots 100",
+        "roulette": "/roulette 100 red",
+        "guess": "/guess 100 50",
+        "football": "/football 100",
+        "basketball": "/basketball 100",
+        "tictactoe": "/ttt",
+    }
+
+    await callback.answer()
+
+    try:
+        await callback.message.edit_text(
+            (
+                f"<b>{labels[game_type]}</b>\n\n"
+                f"Команда: <code>{examples[game_type]}</code>"
+            ),
+            reply_markup=back_keyboard(),
+        )
+    except TelegramBadRequest:
+        pass
+
+
+# ============================================================================
+# TIC TAC TOE
+# ============================================================================
+
+
+@router.message(Command("ttt"))
+async def cmd_ttt(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await start_tictactoe(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(
+        message,
+        result.message,
+        reply_markup=result.keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("ttt:"))
+async def callback_ttt(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    parts = callback.data.split(":")
+
+    if len(parts) != 3:
+        await callback.answer(
+            "Некорректный ход.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        game_id = int(parts[1])
+        position = int(parts[2])
+    except ValueError:
+        await callback.answer(
+            "Некорректный ход.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await tictactoe_move(
+            session=session,
+            game_id=game_id,
+            user_id=callback.from_user.id,
+            position=position,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await callback.answer(
+        result.answer or "",
+        show_alert=result.show_alert,
+    )
+
+    if result.success and callback.message:
+        try:
+            await callback.message.edit_text(
+                result.message,
+                reply_markup=result.keyboard,
+            )
+        except TelegramBadRequest:
+            pass
+
+
+# ============================================================================
+# RP
+# ============================================================================
+
+
+def _extract_rp_target(
+    message: Message,
+    target_text: str,
+) -> tuple[Optional[int], Optional[str]]:
+    target_user_id: Optional[int] = None
+    target_name: Optional[str] = None
+
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+
+        if target:
+            target_user_id = target.id
+            target_name = (
+                f"@{escape(target.username)}"
+                if target.username
+                else escape(target.full_name or "Игрок")
+            )
+
+            return target_user_id, target_name
+
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "text_mention" and entity.user:
+                target_user_id = entity.user.id
+                target_name = escape(
+                    entity.user.full_name or "Игрок"
+                )
+                return target_user_id, target_name
+
+            if entity.type == "mention":
+                offset = entity.offset
+                length = entity.length
+                raw_text = message.text or ""
+                mention = raw_text[offset:offset + length]
+
+                if mention.startswith("@"):
+                    target_name = escape(mention)
+                    return target_user_id, target_name
+
+    if target_text.startswith("@"):
+        target_name = escape(
+            target_text.split()[0]
+        )
+
+    return target_user_id, target_name
 
 
 @router.message(
@@ -992,67 +1128,36 @@ async def rp_handler(message: Message) -> None:
     if text.startswith("/") or text.startswith("!"):
         text = text[1:]
 
-    parts = text.split(maxsplit=1)
+    parts = text.split()
 
     if not parts:
         return
 
-    if len(parts) == 1:
-        action = parts[0].lower()
-        target_text = ""
-    else:
-        first, rest = parts
+    multiword_actions = {
+        "дать пять",
+        "дать подзатыльник",
+        "кинуть тапок",
+    }
 
-        multiword = {
-            "дать пять",
-            "дать подзатыльник",
-            "кинуть тапок",
-        }
+    action = ""
+    target_text = ""
 
-        if f"{first.lower()} {rest.lower().split()[0] if rest else ''}" in multiword:
-            words = text.split(maxsplit=2)
-            action = " ".join(words[:2]).lower()
-            target_text = words[2] if len(words) > 2 else ""
+    if len(parts) >= 2:
+        candidate = f"{parts[0].lower()} {parts[1].lower()}"
+
+        if candidate in multiword_actions:
+            action = candidate
+            target_text = " ".join(parts[2:])
         else:
-            action = first.lower()
-            target_text = rest
+            action = parts[0].lower()
+            target_text = " ".join(parts[1:])
+    else:
+        action = parts[0].lower()
 
-    target_user_id: Optional[int] = None
-    target_name: Optional[str] = None
-
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-
-        if target:
-            target_user_id = target.id
-            target_name = (
-                f"@{escape(target.username)}"
-                if target.username
-                else escape(target.full_name or "Игрок")
-            )
-
-    elif message.entities:
-        for entity in message.entities:
-            if entity.type == "text_mention" and entity.user:
-                target_user_id = entity.user.id
-                target_name = escape(
-                    entity.user.full_name or "Игрок"
-                )
-                break
-
-            if entity.type == "mention":
-                offset = entity.offset
-                length = entity.length
-                mention = text[offset:offset + length]
-
-                if mention.startswith("@"):
-                    target_name = escape(mention)
-                    break
-
-    elif target_text.startswith("@"):
-        target_name = escape(
-            target_text.split()[0]
-        )
+    target_user_id, target_name = _extract_rp_target(
+        message,
+        target_text,
+    )
 
     async with AsyncSessionLocal() as session:
         result = await perform_rp(
@@ -1068,6 +1173,11 @@ async def rp_handler(message: Message) -> None:
             await session.commit()
 
     await reply(message, result.message)
+
+
+# ============================================================================
+# PROFILE SETTINGS
+# ============================================================================
 
 
 @router.message(Command("setnick"))
@@ -1120,6 +1230,11 @@ async def cmd_settag(
         )
 
     await reply(message, result.message)
+
+
+# ============================================================================
+# MODERATION
+# ============================================================================
 
 
 @router.message(Command("warn"))
@@ -1418,6 +1533,11 @@ async def cmd_purge(
     await reply(message, result.message)
 
 
+# ============================================================================
+# ADMIN ECONOMY
+# ============================================================================
+
+
 @router.message(Command("give"))
 async def cmd_give(
     message: Message,
@@ -1586,9 +1706,50 @@ async def cmd_setlevel(
     await reply(message, result.message)
 
 
-@router.message(
-    F.text
-)
+# ============================================================================
+# CASES
+# ============================================================================
+
+
+@router.callback_query(F.data.startswith("case:"))
+async def callback_case(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    case_code = callback.data.split(":", 1)[1]
+
+    async with AsyncSessionLocal() as session:
+        result = await open_case(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            case_code=case_code,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await callback.answer(
+        result.answer or "",
+        show_alert=result.show_alert,
+    )
+
+    if callback.message:
+        try:
+            await callback.message.answer(
+                result.message,
+            )
+        except TelegramBadRequest:
+            pass
+
+
+# ============================================================================
+# ORDINARY MESSAGE / XP / ADULT RP
+# ============================================================================
+
+
+@router.message(F.text)
 async def ordinary_message(message: Message) -> None:
     if not message.from_user:
         return
@@ -1602,6 +1763,36 @@ async def ordinary_message(message: Message) -> None:
     text = (message.text or "").strip()
 
     if not text:
+        return
+
+    # Сначала пробуем распознать RP.
+    # Это позволяет 18+ RP-командам, которые не перечислены
+    # в regexp выше, проходить через тот же perform_rp().
+    target_user_id, target_name = _extract_rp_target(
+        message,
+        text,
+    )
+
+    rp_result: Optional[ServiceResult] = None
+
+    async with AsyncSessionLocal() as session:
+        rp_result = await perform_rp(
+            session=session,
+            chat_id=message.chat.id,
+            actor_id=message.from_user.id,
+            action=text,
+            target_id=target_user_id,
+            target_name=target_name,
+        )
+
+        if rp_result.success:
+            await session.commit()
+
+    if rp_result.success:
+        await reply(
+            message,
+            rp_result.message,
+        )
         return
 
     async with AsyncSessionLocal() as session:
@@ -1620,12 +1811,22 @@ async def ordinary_message(message: Message) -> None:
         )
 
 
+# ============================================================================
+# GLOBAL ERRORS
+# ============================================================================
+
+
 @router.errors()
 async def global_error_handler(event) -> None:
     logger.exception(
         "Необработанная ошибка Telegram handler: %s",
         event.exception,
     )
+
+
+# ============================================================================
+# REGISTRATION
+# ============================================================================
 
 
 def register_handlers(dispatcher) -> None:
