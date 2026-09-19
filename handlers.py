@@ -2,17 +2,6 @@
 Ezzzy Game Bot
 ==============
 handlers.py — Telegram handlers.
-
-Здесь находится взаимодействие с Telegram:
-    - команды;
-    - обычные сообщения;
-    - профили;
-    - статистика;
-    - экономика;
-    - игры;
-    - RP;
-    - модерация;
-    - inline-кнопки.
 """
 
 from __future__ import annotations
@@ -38,11 +27,14 @@ from database import (
     get_or_create_member,
     get_or_create_user,
 )
+
 from services import (
+    ServiceResult,
     balance_user,
     claim_daily_bonus,
     create_game,
     format_balance,
+    format_inventory,
     format_profile,
     format_stats,
     get_game_list,
@@ -72,70 +64,24 @@ from services import (
     admin_take_money,
     admin_set_level,
     admin_set_balance,
+    get_tag_keyboard,
+    select_tag,
+    open_case,
 )
-
 
 logger = logging.getLogger("EzzzyGameBot.handlers")
 
 router = Router(name="main")
 
 
-# ============================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================================
-
-
 def is_group(message: Message) -> bool:
-    """Проверяет, является ли сообщение сообщением группы."""
-
     return message.chat.type in {
         ChatType.GROUP,
         ChatType.SUPERGROUP,
     }
 
 
-def user_display_name(
-    message: Message,
-) -> str:
-    """Безопасное отображаемое имя пользователя."""
-
-    if not message.from_user:
-        return "Игрок"
-
-    if message.from_user.username:
-        return f"@{escape(message.from_user.username)}"
-
-    return escape(
-        message.from_user.full_name or "Игрок"
-    )
-
-
-def target_display_name(
-    message: Message,
-) -> Optional[str]:
-    """Получает имя пользователя из reply."""
-
-    if not message.reply_to_message:
-        return None
-
-    user = message.reply_to_message.from_user
-
-    if not user:
-        return None
-
-    if user.username:
-        return f"@{escape(user.username)}"
-
-    return escape(
-        user.full_name or "Игрок"
-    )
-
-
-def parse_integer(
-    value: Optional[str],
-) -> Optional[int]:
-    """Безопасный парсинг целого числа."""
-
+def parse_integer(value: Optional[str]) -> Optional[int]:
     if not value:
         return None
 
@@ -145,13 +91,25 @@ def parse_integer(
         return None
 
 
-async def get_or_prepare_member(
+async def reply(
     message: Message,
-):
-    """
-    Создаёт/обновляет пользователя, группу и профиль участника.
-    """
+    text: str,
+    **kwargs,
+) -> Optional[Message]:
+    try:
+        return await message.answer(text, **kwargs)
+    except TelegramForbiddenError:
+        logger.warning(
+            "Telegram запретил отправку сообщения chat_id=%s",
+            message.chat.id,
+        )
+    except TelegramBadRequest:
+        logger.exception("Telegram отклонил сообщение.")
 
+    return None
+
+
+async def get_or_prepare_member(message: Message):
     if not message.from_user:
         return None
 
@@ -183,34 +141,7 @@ async def get_or_prepare_member(
         return member
 
 
-async def reply(
-    message: Message,
-    text: str,
-    **kwargs,
-) -> Optional[Message]:
-    """Безопасный ответ на сообщение."""
-
-    try:
-        return await message.answer(
-            text,
-            **kwargs,
-        )
-    except TelegramForbiddenError:
-        logger.warning(
-            "Telegram запретил отправку сообщения в chat_id=%s",
-            message.chat.id,
-        )
-    except TelegramBadRequest:
-        logger.exception(
-            "Telegram отклонил сообщение."
-        )
-
-    return None
-
-
 def games_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура списка игр."""
-
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -239,8 +170,18 @@ def games_keyboard() -> InlineKeyboardMarkup:
                     callback_data="game:guess",
                 ),
                 InlineKeyboardButton(
-                    text="⭕❌ Крестики-нолики",
-                    callback_data="game:ttt",
+                    text="⚽ Футбол",
+                    callback_data="game:football",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏀 Баскетбол",
+                    callback_data="game:basketball",
+                ),
+                InlineKeyboardButton(
+                    text="⭕❌ TTT",
+                    callback_data="game:tictactoe",
                 ),
             ],
         ]
@@ -248,8 +189,6 @@ def games_keyboard() -> InlineKeyboardMarkup:
 
 
 def back_keyboard() -> InlineKeyboardMarkup:
-    """Кнопка возврата к играм."""
-
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -262,101 +201,74 @@ def back_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-# ============================================================================
-# START / HELP
-# ============================================================================
-
-
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
-    """Стартовая команда."""
+    await get_or_prepare_member(message)
 
-    if message.from_user:
-        await get_or_prepare_member(message)
-
-    text = (
-        "<b>🥜 Ezzzy Game Bot</b>\n\n"
-        "Добро пожаловать!\n\n"
-        "Я умею:\n"
-        "🥜 выдавать арахис за активность\n"
-        "⭐ прокачивать уровни\n"
-        "🎰 запускать мини-игры\n"
-        "🫂 выполнять RP-команды\n"
-        "🏆 вести рейтинги\n"
-        "👤 хранить профиль отдельно для каждой группы\n"
-        "🔨 помогать администрации\n\n"
-        "Нажми /help, чтобы посмотреть команды."
+    await reply(
+        message,
+        (
+            "<b>🥜 Ezzzy Game Bot</b>\n\n"
+            "Добро пожаловать!\n\n"
+            "⭐ Уровни\n"
+            "🎮 Мини-игры\n"
+            "💰 Экономика\n"
+            "🏆 Battle Pass\n"
+            "🏷 Теги\n"
+            "🎭 RP\n"
+            "🛡 Модерация\n\n"
+            "Используй /help."
+        ),
     )
-
-    await reply(message, text)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    """Список возможностей."""
-
-    text = (
-        "<b>📚 Команды Ezzzy</b>\n\n"
-        "<b>👤 Профиль</b>\n"
-        "/profile — профиль\n"
-        "/stats — статистика\n"
-        "/balance — баланс\n"
-        "/top — рейтинг\n\n"
-        "<b>🎮 Игры</b>\n"
-        "/games — мини-игры\n"
-        "/bonus — ежедневный бонус\n"
-        "/coinflip [ставка] — монетка\n"
-        "/dice [ставка] — кубики\n"
-        "/slots [ставка] — слоты\n"
-        "/roulette [ставка] — рулетка\n"
-        "/guess [ставка] [число] — угадай число\n"
-        "/ttt — крестики-нолики\n\n"
-        "<b>💰 Экономика</b>\n"
-        "/pay [сумма] — перевод в reply\n\n"
-        "<b>🎭 RP</b>\n"
-        "обнять @user\n"
-        "пожать @user\n"
-        "поцеловать @user\n"
-        "пнуть @user\n"
-        "ударить @user\n"
-        "погладить @user\n"
-        "подмигнуть @user\n"
-        "дать пять @user\n"
-        "поздравить @user\n"
-        "пожалеть @user\n"
-        "рассмешить @user\n"
-        "напугать @user\n"
-        "ткнуть @user\n"
-        "укусить @user\n"
-        "дать подзатыльник @user\n"
-        "кинуть тапок @user\n"
-        "или ответь на сообщение и напиши:\n"
-        "<code>обнять</code>\n\n"
-        "<b>🛡 Модерация</b>\n"
-        "/warn\n"
-        "/warnings\n"
-        "/mute\n"
-        "/unmute\n"
-        "/ban\n"
-        "/unban\n"
-        "/kick\n"
-        "/setnick\n"
-        "/settag\n"
-        "/purge\n"
+    await reply(
+        message,
+        (
+            "<b>📚 Команды Ezzzy</b>\n\n"
+            "<b>👤 Профиль</b>\n"
+            "/profile\n"
+            "/stats\n"
+            "/balance\n"
+            "/inventory\n"
+            "/tag\n"
+            "/battlepass\n"
+            "/top\n\n"
+            "<b>🎮 Игры</b>\n"
+            "/games\n"
+            "/bonus\n"
+            "/coinflip 100\n"
+            "/dice 100\n"
+            "/slots 100\n"
+            "/roulette 100 red\n"
+            "/guess 100 50\n"
+            "/ttt\n\n"
+            "<b>💰 Экономика</b>\n"
+            "/pay 100\n"
+            "/rob\n\n"
+            "<b>🎭 RP</b>\n"
+            "обычные RP-команды работают текстом\n"
+            "18+ RP-команды работают текстом\n"
+            "или через reply\n\n"
+            "<b>🛡 Модерация</b>\n"
+            "/warn\n"
+            "/unwarn\n"
+            "/warnings\n"
+            "/mute\n"
+            "/unmute\n"
+            "/ban\n"
+            "/unban\n"
+            "/kick\n"
+            "/purge\n"
+            "/setnick\n"
+        ),
     )
-
-    await reply(message, text)
-
-
-# ============================================================================
-# PROFILE
-# ============================================================================
 
 
 @router.message(Command("profile"))
 async def cmd_profile(message: Message) -> None:
-    """Профиль пользователя."""
-
     if not message.from_user:
         return
 
@@ -374,8 +286,6 @@ async def cmd_profile(message: Message) -> None:
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
-    """Статистика пользователя."""
-
     if not message.from_user:
         return
 
@@ -393,8 +303,6 @@ async def cmd_stats(message: Message) -> None:
 
 @router.message(Command("balance"))
 async def cmd_balance(message: Message) -> None:
-    """Баланс пользователя."""
-
     if not message.from_user:
         return
 
@@ -409,14 +317,120 @@ async def cmd_balance(message: Message) -> None:
 
     await reply(
         message,
-        f"🥜 Твой баланс: <b>{balance:,}</b>".replace(",", " "),
+        f"🥜 Баланс: <b>{format_balance(balance)}</b>",
     )
+
+
+@router.message(Command("inventory"))
+async def cmd_inventory(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    await get_or_prepare_member(message)
+
+    async with AsyncSessionLocal() as session:
+        text = await format_inventory(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+
+    await reply(message, text)
+
+
+@router.message(Command("tag"))
+async def cmd_tag(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    await get_or_prepare_member(message)
+
+    async with AsyncSessionLocal() as session:
+        keyboard = await get_tag_keyboard(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+
+    await reply(
+        message,
+        (
+            "🏷 <b>Твои теги</b>\n\n"
+            "Выбери тег кнопкой ниже."
+        ),
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("tagselect:"))
+async def callback_tag_select(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+
+    raw_id = callback.data.split(":", 1)[1]
+    tag_id = parse_integer(raw_id)
+
+    if tag_id is None:
+        await callback.answer(
+            "Некорректный тег.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await select_tag(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            tag_id=tag_id,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
+
+    if result.success:
+        async with AsyncSessionLocal() as session:
+            keyboard = await get_tag_keyboard(
+                session=session,
+                chat_id=callback.message.chat.id,
+                user_id=callback.from_user.id,
+            )
+
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=keyboard,
+            )
+        except TelegramBadRequest:
+            pass
+
+
+@router.message(Command("battlepass"))
+async def cmd_battlepass(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    await get_or_prepare_member(message)
+
+    async with AsyncSessionLocal() as session:
+        from services import format_battle_pass
+
+        result = await format_battle_pass(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+
+    await reply(message, result)
 
 
 @router.message(Command("top"))
 async def cmd_top(message: Message) -> None:
-    """Таблица лидеров."""
-
     if not is_group(message):
         await reply(
             message,
@@ -433,15 +447,8 @@ async def cmd_top(message: Message) -> None:
     await reply(message, text)
 
 
-# ============================================================================
-# DAILY BONUS
-# ============================================================================
-
-
 @router.message(Command("bonus"))
 async def cmd_bonus(message: Message) -> None:
-    """Ежедневный бонус."""
-
     if not message.from_user:
         return
 
@@ -454,17 +461,10 @@ async def cmd_bonus(message: Message) -> None:
             user_id=message.from_user.id,
         )
 
-        await session.commit()
+        if result.success:
+            await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
-
-
-# ============================================================================
-# ECONOMY
-# ============================================================================
+    await reply(message, result.message)
 
 
 @router.message(Command("pay"))
@@ -472,16 +472,14 @@ async def cmd_pay(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Перевод арахиса другому пользователю."""
-
     if not message.from_user:
         return
 
     if not message.reply_to_message:
         await reply(
             message,
-            "💸 Используй команду ответом на сообщение:\n"
-            "<code>/pay 500</code>",
+            "💸 Используй /pay ответом на сообщение.\n"
+            "Пример: <code>/pay 500</code>",
         )
         return
 
@@ -490,8 +488,7 @@ async def cmd_pay(
     if amount is None or amount <= 0:
         await reply(
             message,
-            "❌ Укажи положительную сумму.\n"
-            "Пример: <code>/pay 500</code>",
+            "❌ Укажи положительную сумму.",
         )
         return
 
@@ -507,7 +504,7 @@ async def cmd_pay(
     if target.id == message.from_user.id:
         await reply(
             message,
-            "😐 Самому себе переводить арахис нельзя.",
+            "😐 Самому себе переводить нельзя.",
         )
         return
 
@@ -523,27 +520,57 @@ async def cmd_pay(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
+    await reply(message, result.message)
+
+
+@router.message(Command("rob"))
+async def cmd_rob(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    target = (
+        message.reply_to_message.from_user
+        if message.reply_to_message
+        else None
     )
 
+    if target is None:
+        await reply(
+            message,
+            "🥷 Используй /rob ответом на сообщение цели.",
+        )
+        return
 
-# ============================================================================
-# GAMES
-# ============================================================================
+    if target.id == message.from_user.id:
+        await reply(
+            message,
+            "😐 Себя ограбить нельзя.",
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        from services import rob_user
+
+        result = await rob_user(
+            session=session,
+            chat_id=message.chat.id,
+            actor_id=message.from_user.id,
+            target_id=target.id,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(message, result.message)
 
 
 @router.message(Command("games"))
 async def cmd_games(message: Message) -> None:
-    """Меню мини-игр."""
-
     await reply(
         message,
         (
             "<b>🎮 Мини-игры</b>\n\n"
-            "Выбирай игру кнопкой ниже.\n"
-            "Для большинства игр понадобится ставка."
+            "Выбери игру:"
         ),
         reply_markup=games_keyboard(),
     )
@@ -554,8 +581,6 @@ async def cmd_coinflip(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Монетка."""
-
     if not message.from_user:
         return
 
@@ -579,10 +604,7 @@ async def cmd_coinflip(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("dice"))
@@ -590,8 +612,6 @@ async def cmd_dice(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Кубики."""
-
     if not message.from_user:
         return
 
@@ -615,10 +635,7 @@ async def cmd_dice(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("slots"))
@@ -626,8 +643,6 @@ async def cmd_slots(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Слоты."""
-
     if not message.from_user:
         return
 
@@ -651,10 +666,7 @@ async def cmd_slots(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("roulette"))
@@ -662,8 +674,6 @@ async def cmd_roulette(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Рулетка."""
-
     if not message.from_user:
         return
 
@@ -672,9 +682,11 @@ async def cmd_roulette(
     if len(args) < 2:
         await reply(
             message,
-            "🎡 Формат:\n"
-            "<code>/roulette 100 red</code>\n\n"
-            "Варианты: red, black, green",
+            (
+                "🎡 Формат:\n"
+                "<code>/roulette 100 red</code>\n\n"
+                "Варианты: red, black, green"
+            ),
         )
         return
 
@@ -700,10 +712,7 @@ async def cmd_roulette(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("guess"))
@@ -711,19 +720,15 @@ async def cmd_guess(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Угадай число."""
-
     if not message.from_user:
         return
 
     args = (command.args or "").split()
 
-    if len(args) != 2:
+    if len(args) < 2:
         await reply(
             message,
-            "🔢 Формат:\n"
-            "<code>/guess 100 7</code>\n\n"
-            "Число должно быть от 1 до 10.",
+            "🔢 Формат: <code>/guess 100 50</code>",
         )
         return
 
@@ -733,7 +738,7 @@ async def cmd_guess(
     if bet is None or number is None:
         await reply(
             message,
-            "❌ Некорректные данные.",
+            "❌ Некорректные параметры.",
         )
         return
 
@@ -743,35 +748,35 @@ async def cmd_guess(
             chat_id=message.chat.id,
             user_id=message.from_user.id,
             bet=bet,
-            number=number,
+            guess=number,
         )
 
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
-
-
-# ============================================================================
-# TIC TAC TOE
-# ============================================================================
+    await reply(message, result.message)
 
 
 @router.message(Command("ttt"))
 async def cmd_ttt(message: Message) -> None:
-    """Создание игры крестики-нолики."""
-
     if not message.from_user:
         return
+
+    args = (message.text or "").split()
+
+    bet = 0
+
+    if len(args) >= 2:
+        parsed = parse_integer(args[1])
+        if parsed is not None:
+            bet = parsed
 
     async with AsyncSessionLocal() as session:
         result = await start_tictactoe(
             session=session,
             chat_id=message.chat.id,
             user_id=message.from_user.id,
+            bet=bet,
         )
 
         if result.success:
@@ -784,104 +789,27 @@ async def cmd_ttt(message: Message) -> None:
     )
 
 
-# ============================================================================
-# GAME CALLBACKS
-# ============================================================================
-
-
-@router.callback_query(F.data == "games:menu")
-async def callback_games_menu(
-    callback: CallbackQuery,
-) -> None:
-    """Возврат в меню игр."""
-
-    await callback.answer()
-
-    if callback.message:
-        await callback.message.edit_text(
-            "<b>🎮 Мини-игры</b>\n\nВыбирай игру:",
-            reply_markup=games_keyboard(),
-        )
-
-
-@router.callback_query(F.data.startswith("game:"))
-async def callback_game(
-    callback: CallbackQuery,
-) -> None:
-    """Обработка выбора игры."""
-
-    game_name = callback.data.split(":", 1)[1]
-
-    descriptions = {
-        "coinflip": (
-            "🪙 <b>Монетка</b>\n\n"
-            "Используй:\n"
-            "<code>/coinflip 100</code>"
-        ),
-        "dice": (
-            "🎲 <b>Кубики</b>\n\n"
-            "Используй:\n"
-            "<code>/dice 100</code>"
-        ),
-        "slots": (
-            "🎰 <b>Слоты</b>\n\n"
-            "Используй:\n"
-            "<code>/slots 100</code>"
-        ),
-        "roulette": (
-            "🎡 <b>Рулетка</b>\n\n"
-            "Используй:\n"
-            "<code>/roulette 100 red</code>"
-        ),
-        "guess": (
-            "🔢 <b>Угадай число</b>\n\n"
-            "Используй:\n"
-            "<code>/guess 100 7</code>"
-        ),
-        "ttt": (
-            "⭕❌ <b>Крестики-нолики</b>\n\n"
-            "Используй /ttt."
-        ),
-    }
-
-    text = descriptions.get(
-        game_name,
-        "❌ Неизвестная игра.",
-    )
-
-    await callback.answer()
-
-    if callback.message:
-        await callback.message.edit_text(
-            text,
-            reply_markup=back_keyboard(),
-        )
-
-
 @router.callback_query(F.data.startswith("ttt:"))
-async def callback_ttt(
-    callback: CallbackQuery,
-) -> None:
-    """Ходы крестиков-ноликов."""
-
-    if not callback.from_user:
+async def callback_ttt(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
         return
 
     parts = callback.data.split(":")
 
     if len(parts) != 3:
         await callback.answer(
-            "❌ Некорректный ход.",
+            "Некорректный ход.",
             show_alert=True,
         )
         return
 
-    try:
-        game_id = int(parts[1])
-        position = int(parts[2])
-    except ValueError:
+    game_id = parse_integer(parts[1])
+    position = parse_integer(parts[2])
+
+    if game_id is None or position is None:
         await callback.answer(
-            "❌ Некорректный ход.",
+            "Некорректный ход.",
             show_alert=True,
         )
         return
@@ -902,36 +830,161 @@ async def callback_ttt(
         show_alert=result.show_alert,
     )
 
-    if callback.message:
-        try:
+    try:
+        if result.keyboard is not None:
             await callback.message.edit_text(
                 result.message,
                 reply_markup=result.keyboard,
             )
-        except TelegramBadRequest:
-            pass
+        else:
+            await callback.message.edit_text(
+                result.message,
+            )
+    except TelegramBadRequest:
+        pass
 
 
-# ============================================================================
-# RP
-# ============================================================================
+@router.callback_query(F.data.startswith("game:"))
+async def callback_game(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    game = callback.data.split(":", 1)[1]
+
+    await callback.answer()
+
+    if game == "coinflip":
+        await callback.message.answer(
+            "🪙 Используй <code>/coinflip ставка</code>."
+        )
+        return
+
+    if game == "dice":
+        await callback.message.answer(
+            "🎲 Используй <code>/dice ставка</code>."
+        )
+        return
+
+    if game == "slots":
+        await callback.message.answer(
+            "🎰 Используй <code>/slots ставка</code>."
+        )
+        return
+
+    if game == "roulette":
+        await callback.message.answer(
+            "🎡 Используй <code>/roulette ставка red</code>."
+        )
+        return
+
+    if game == "guess":
+        await callback.message.answer(
+            "🔢 Используй <code>/guess ставка число</code>."
+        )
+        return
+
+    if game == "football":
+        await callback.message.answer(
+            "⚽ Используй <code>/football ставка</code>."
+        )
+        return
+
+    if game == "basketball":
+        await callback.message.answer(
+            "🏀 Используй <code>/basketball ставка</code>."
+        )
+        return
+
+    if game == "tictactoe":
+        await callback.message.answer(
+            "⭕❌ Используй <code>/ttt</code>."
+        )
+        return
+
+    await callback.message.answer(
+        "❌ Неизвестная игра."
+    )
+
+
+@router.message(Command("football"))
+async def cmd_football(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    if not message.from_user:
+        return
+
+    bet = parse_integer(command.args)
+
+    if bet is None:
+        await reply(
+            message,
+            "⚽ Пример: <code>/football 100</code>",
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        from services import play_telegram_dice_game
+
+        result = await play_telegram_dice_game(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            game_type="football",
+            bet=bet,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(message, result.message)
+
+
+@router.message(Command("basketball"))
+async def cmd_basketball(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    if not message.from_user:
+        return
+
+    bet = parse_integer(command.args)
+
+    if bet is None:
+        await reply(
+            message,
+            "🏀 Пример: <code>/basketball 100</code>",
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        from services import play_telegram_dice_game
+
+        result = await play_telegram_dice_game(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            game_type="basketball",
+            bet=bet,
+        )
+
+        if result.success:
+            await session.commit()
+
+    await reply(message, result.message)
 
 
 @router.message(
     F.text.regexp(
         r"^(?:[/!])?(обнять|пожать|поцеловать|пнуть|ударить|"
-        r"погладить|подмигнуть|дать\s*пять|поздравить|пожалеть|"
+        r"погладить|подмигнуть|дать\s+пять|поздравить|пожалеть|"
         r"рассмешить|напугать|ткнуть|укусить|дать\s+подзатыльник|"
         r"кинуть\s+тапок)(?:\s+.+)?$"
     )
 )
 async def rp_handler(message: Message) -> None:
-    """RP-команды."""
-
-    if not message.from_user:
-        return
-
-    if not is_group(message):
+    if not message.from_user or not is_group(message):
         return
 
     text = (message.text or "").strip()
@@ -944,7 +997,25 @@ async def rp_handler(message: Message) -> None:
     if not parts:
         return
 
-    action = parts[0].lower().replace(" ", "_")
+    if len(parts) == 1:
+        action = parts[0].lower()
+        target_text = ""
+    else:
+        first, rest = parts
+
+        multiword = {
+            "дать пять",
+            "дать подзатыльник",
+            "кинуть тапок",
+        }
+
+        if f"{first.lower()} {rest.lower().split()[0] if rest else ''}" in multiword:
+            words = text.split(maxsplit=2)
+            action = " ".join(words[:2]).lower()
+            target_text = words[2] if len(words) > 2 else ""
+        else:
+            action = first.lower()
+            target_text = rest
 
     target_user_id: Optional[int] = None
     target_name: Optional[str] = None
@@ -954,7 +1025,6 @@ async def rp_handler(message: Message) -> None:
 
         if target:
             target_user_id = target.id
-
             target_name = (
                 f"@{escape(target.username)}"
                 if target.username
@@ -963,30 +1033,26 @@ async def rp_handler(message: Message) -> None:
 
     elif message.entities:
         for entity in message.entities:
-            if entity.type == "text_mention":
-                if entity.user:
-                    target_user_id = entity.user.id
-                    target_name = escape(
-                        entity.user.full_name or "Игрок"
-                    )
-                    break
+            if entity.type == "text_mention" and entity.user:
+                target_user_id = entity.user.id
+                target_name = escape(
+                    entity.user.full_name or "Игрок"
+                )
+                break
 
             if entity.type == "mention":
                 offset = entity.offset
                 length = entity.length
-
                 mention = text[offset:offset + length]
 
                 if mention.startswith("@"):
                     target_name = escape(mention)
                     break
 
-    if target_user_id == message.from_user.id:
-        await reply(
-            message,
-            "😐 Себя обнимать немного странно.",
+    elif target_text.startswith("@"):
+        target_name = escape(
+            target_text.split()[0]
         )
-        return
 
     async with AsyncSessionLocal() as session:
         result = await perform_rp(
@@ -998,15 +1064,10 @@ async def rp_handler(message: Message) -> None:
             target_name=target_name,
         )
 
-    await reply(
-        message,
-        result.message,
-    )
+        if result.success:
+            await session.commit()
 
-
-# ============================================================================
-# PROFILE NICK / TAG
-# ============================================================================
+    await reply(message, result.message)
 
 
 @router.message(Command("setnick"))
@@ -1014,8 +1075,6 @@ async def cmd_setnick(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Изменение игрового ника."""
-
     if not message.from_user:
         return
 
@@ -1024,8 +1083,7 @@ async def cmd_setnick(
     if not nick:
         await reply(
             message,
-            "✏️ Пример:\n"
-            "<code>/setnick Батя</code>",
+            "✏️ Пример: <code>/setnick Батя</code>",
         )
         return
 
@@ -1040,10 +1098,7 @@ async def cmd_setnick(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("settag"))
@@ -1051,20 +1106,10 @@ async def cmd_settag(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Изменение Telegram/profile tag."""
-
     if not message.from_user:
         return
 
     tag = (command.args or "").strip()
-
-    if not tag:
-        await reply(
-            message,
-            "🏷 Пример:\n"
-            "<code>/settag Батяра</code>",
-        )
-        return
 
     async with AsyncSessionLocal() as session:
         result = await set_profile_tag(
@@ -1074,18 +1119,7 @@ async def cmd_settag(
             tag=tag,
         )
 
-        if result.success:
-            await session.commit()
-
-    await reply(
-        message,
-        result.message,
-    )
-
-
-# ============================================================================
-# MODERATION
-# ============================================================================
+    await reply(message, result.message)
 
 
 @router.message(Command("warn"))
@@ -1093,16 +1127,14 @@ async def cmd_warn(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Выдать предупреждение."""
+    if not message.from_user:
+        return
 
     if not message.reply_to_message:
         await reply(
             message,
-            "⚠️ Используй /warn ответом на сообщение пользователя.",
+            "⚠️ Используй /warn ответом на сообщение.",
         )
-        return
-
-    if not message.from_user:
         return
 
     target = message.reply_to_message.from_user
@@ -1124,18 +1156,11 @@ async def cmd_warn(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("warnings"))
-async def cmd_warnings(
-    message: Message,
-) -> None:
-    """Показать предупреждения пользователя."""
-
+async def cmd_warnings(message: Message) -> None:
     if not message.from_user:
         return
 
@@ -1153,17 +1178,13 @@ async def cmd_warnings(
             user_id=target_id,
         )
 
-    await reply(
-        message,
-        result,
-    )
+    await reply(message, result)
 
 
 @router.message(Command("unwarn"))
-async def cmd_unwarn(
-    message: Message,
-) -> None:
-    """Снять последнее предупреждение."""
+async def cmd_unwarn(message: Message) -> None:
+    if not message.from_user:
+        return
 
     if not message.reply_to_message:
         await reply(
@@ -1172,17 +1193,12 @@ async def cmd_unwarn(
         )
         return
 
-    if not message.from_user:
-        return
-
     target = message.reply_to_message.from_user
 
     if not target:
         return
 
     async with AsyncSessionLocal() as session:
-        from services import remove_warning
-
         result = await remove_warning(
             session=session,
             chat_id=message.chat.id,
@@ -1193,10 +1209,7 @@ async def cmd_unwarn(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("mute"))
@@ -1204,18 +1217,11 @@ async def cmd_mute(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Мут пользователя."""
-
-    if not message.reply_to_message:
+    if not message.from_user or not message.reply_to_message:
         await reply(
             message,
-            "🔇 Используй /mute ответом на сообщение.\n"
-            "Можно указать минуты:\n"
-            "<code>/mute 30</code>",
+            "🔇 Используй /mute ответом на сообщение.",
         )
-        return
-
-    if not message.from_user:
         return
 
     target = message.reply_to_message.from_user
@@ -1223,9 +1229,8 @@ async def cmd_mute(
     if not target:
         return
 
-    args = (command.args or "").split()
-
     duration = 60
+    args = (command.args or "").split()
 
     if args:
         parsed = parse_integer(args[0])
@@ -1246,26 +1251,16 @@ async def cmd_mute(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("unmute"))
-async def cmd_unmute(
-    message: Message,
-) -> None:
-    """Снять мут."""
-
-    if not message.reply_to_message:
+async def cmd_unmute(message: Message) -> None:
+    if not message.from_user or not message.reply_to_message:
         await reply(
             message,
             "Используй /unmute ответом на сообщение.",
         )
-        return
-
-    if not message.from_user:
         return
 
     target = message.reply_to_message.from_user
@@ -1285,10 +1280,7 @@ async def cmd_unmute(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("ban"))
@@ -1296,16 +1288,11 @@ async def cmd_ban(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Забанить пользователя."""
-
-    if not message.reply_to_message:
+    if not message.from_user or not message.reply_to_message:
         await reply(
             message,
             "Используй /ban ответом на сообщение.",
         )
-        return
-
-    if not message.from_user:
         return
 
     target = message.reply_to_message.from_user
@@ -1328,10 +1315,7 @@ async def cmd_ban(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("unban"))
@@ -1339,8 +1323,6 @@ async def cmd_unban(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Разбанить пользователя по Telegram ID."""
-
     if not message.from_user:
         return
 
@@ -1351,8 +1333,7 @@ async def cmd_unban(
     if target_id is None:
         await reply(
             message,
-            "Пример:\n"
-            "<code>/unban 123456789</code>",
+            "Пример: <code>/unban 123456789</code>",
         )
         return
 
@@ -1368,10 +1349,7 @@ async def cmd_unban(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("kick"))
@@ -1379,16 +1357,11 @@ async def cmd_kick(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Кик пользователя."""
-
-    if not message.reply_to_message:
+    if not message.from_user or not message.reply_to_message:
         await reply(
             message,
             "Используй /kick ответом на сообщение.",
         )
-        return
-
-    if not message.from_user:
         return
 
     target = message.reply_to_message.from_user
@@ -1411,10 +1384,7 @@ async def cmd_kick(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("purge"))
@@ -1422,8 +1392,6 @@ async def cmd_purge(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Удалить последние сообщения."""
-
     if not message.from_user:
         return
 
@@ -1432,7 +1400,7 @@ async def cmd_purge(
     if amount is None:
         amount = 10
 
-    if amount < 1 or amount > 100:
+    if not 1 <= amount <= 100:
         await reply(
             message,
             "Количество сообщений должно быть от 1 до 100.",
@@ -1447,15 +1415,7 @@ async def cmd_purge(
             count=amount,
         )
 
-    await reply(
-        message,
-        result.message,
-    )
-
-
-# ============================================================================
-# OWNER / ECONOMY ADMIN
-# ============================================================================
+    await reply(message, result.message)
 
 
 @router.message(Command("give"))
@@ -1463,8 +1423,6 @@ async def cmd_give(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Выдать арахис владельцем бота."""
-
     if not message.from_user:
         return
 
@@ -1473,8 +1431,7 @@ async def cmd_give(
     if len(args) != 2:
         await reply(
             message,
-            "Пример:\n"
-            "<code>/give 123456789 1000</code>",
+            "Пример: <code>/give 123456789 1000</code>",
         )
         return
 
@@ -1500,10 +1457,7 @@ async def cmd_give(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("take"))
@@ -1511,8 +1465,6 @@ async def cmd_take(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Забрать арахис."""
-
     if not message.from_user:
         return
 
@@ -1521,8 +1473,7 @@ async def cmd_take(
     if len(args) != 2:
         await reply(
             message,
-            "Пример:\n"
-            "<code>/take 123456789 1000</code>",
+            "Пример: <code>/take 123456789 1000</code>",
         )
         return
 
@@ -1548,10 +1499,7 @@ async def cmd_take(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("setbalance"))
@@ -1559,8 +1507,6 @@ async def cmd_setbalance(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Установить баланс."""
-
     if not message.from_user:
         return
 
@@ -1569,8 +1515,7 @@ async def cmd_setbalance(
     if len(args) != 2:
         await reply(
             message,
-            "Пример:\n"
-            "<code>/setbalance 123456789 5000</code>",
+            "Пример: <code>/setbalance 123456789 5000</code>",
         )
         return
 
@@ -1596,10 +1541,7 @@ async def cmd_setbalance(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
 @router.message(Command("setlevel"))
@@ -1607,8 +1549,6 @@ async def cmd_setlevel(
     message: Message,
     command: CommandObject,
 ) -> None:
-    """Установить уровень."""
-
     if not message.from_user:
         return
 
@@ -1617,8 +1557,7 @@ async def cmd_setlevel(
     if len(args) != 2:
         await reply(
             message,
-            "Пример:\n"
-            "<code>/setlevel 123456789 10</code>",
+            "Пример: <code>/setlevel 123456789 10</code>",
         )
         return
 
@@ -1644,42 +1583,25 @@ async def cmd_setlevel(
         if result.success:
             await session.commit()
 
-    await reply(
-        message,
-        result.message,
-    )
+    await reply(message, result.message)
 
 
-# ============================================================================
-# ОБЫЧНЫЕ СООБЩЕНИЯ
-# ============================================================================
-
-
-@router.message()
-async def ordinary_message(
-    message: Message,
-) -> None:
-    """
-    Главный обработчик обычных сообщений.
-
-    Здесь:
-        - регистрируется пользователь;
-        - считается сообщение;
-        - начисляется XP;
-        - начисляется арахис;
-        - проверяется повышение уровня.
-    """
-
+@router.message(
+    F.text
+)
+async def ordinary_message(message: Message) -> None:
     if not message.from_user:
         return
 
-    # Не учитываем сообщения от ботов.
     if message.from_user.is_bot:
         return
 
-    # Личные сообщения тоже поддерживаем для регистрации,
-    # но игровая статистика группы используется только в группах.
     if not is_group(message):
+        return
+
+    text = (message.text or "").strip()
+
+    if not text:
         return
 
     async with AsyncSessionLocal() as session:
@@ -1691,7 +1613,6 @@ async def ordinary_message(
         if result.changed:
             await session.commit()
 
-    # Сообщение об уровне отправляем только при повышении.
     if result.level_up_message:
         await reply(
             message,
@@ -1699,37 +1620,14 @@ async def ordinary_message(
         )
 
 
-# ============================================================================
-# ERROR HANDLER
-# ============================================================================
-
-
 @router.errors()
-async def global_error_handler(
-    event,
-) -> None:
-    """Глобальная защита от необработанных ошибок."""
-
+async def global_error_handler(event) -> None:
     logger.exception(
         "Необработанная ошибка Telegram handler: %s",
         event.exception,
     )
 
 
-# ============================================================================
-# REGISTRATION
-# ============================================================================
-
-
-def register_handlers(
-    dispatcher,
-) -> None:
-    """
-    Регистрирует основной Router в Dispatcher.
-    """
-
+def register_handlers(dispatcher) -> None:
     dispatcher.include_router(router)
-
-    logger.info(
-        "Основной router зарегистрирован."
-    )
+    logger.info("Основной router зарегистрирован.")
