@@ -29,8 +29,6 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    event,
-    inspect,
     select,
     text,
 )
@@ -45,6 +43,7 @@ from sqlalchemy.orm import (
     Mapped,
     mapped_column,
     relationship,
+    synonym,
 )
 
 
@@ -660,6 +659,8 @@ class Game(Base):
         nullable=True,
     )
 
+    completed_at = synonym("finished_at")
+
 
 # ============================================================================
 # TIC TAC TOE
@@ -920,6 +921,9 @@ class ModPermission(Base):
         String(32),
         nullable=False,
     )
+
+    # Совместимость со старой версией services.py.
+    scope = synonym("required_role")
 
     updated_by: Mapped[Optional[int]] = mapped_column(
         BigInteger,
@@ -1350,6 +1354,9 @@ class Giveaway(Base):
         nullable=True,
     )
 
+    # Совместимость со старой версией services.py.
+    prize_description = synonym("prize_external")
+
     winners_count: Mapped[int] = mapped_column(
         Integer,
         default=1,
@@ -1372,6 +1379,9 @@ class Giveaway(Base):
         nullable=True,
     )
 
+    # Совместимость со старой версией services.py.
+    winner_id = synonym("winner_user_id")
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=utcnow,
@@ -1383,6 +1393,9 @@ class Giveaway(Base):
         nullable=True,
     )
 
+    # Совместимость со старой версией services.py.
+    completed_at = synonym("finished_at")
+
 
 class GiveawayParticipant(Base):
     __tablename__ = "giveaway_participants"
@@ -1391,6 +1404,12 @@ class GiveawayParticipant(Base):
         Integer,
         primary_key=True,
         autoincrement=True,
+    )
+
+    chat_id: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        index=True,
     )
 
     giveaway_id: Mapped[int] = mapped_column(
@@ -1874,14 +1893,39 @@ async def _column_names(
     connection,
     table_name: str,
 ) -> set[str]:
-    result = await connection.execute(
-        text(f"PRAGMA table_info({table_name})")
-    )
+    dialect = connection.dialect.name
 
-    return {
-        row[1]
-        for row in result.fetchall()
-    }
+    if dialect == "sqlite":
+        result = await connection.execute(
+            text(f'PRAGMA table_info("{table_name}")')
+        )
+
+        return {
+            row[1]
+            for row in result.fetchall()
+        }
+
+    if dialect == "postgresql":
+        result = await connection.execute(
+            text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = :table_name
+                """
+            ),
+            {
+                "table_name": table_name,
+            },
+        )
+
+        return {
+            row[0]
+            for row in result.fetchall()
+        }
+
+    return set()
 
 
 async def _sqlite_table_exists(
@@ -1905,12 +1949,21 @@ async def _postgres_table_exists(
 ) -> bool:
     result = await connection.execute(
         text(
-            "SELECT to_regclass(:name)"
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = current_schema()
+                  AND table_name = :table_name
+            )
+            """
         ),
-        {"name": table_name},
+        {
+            "table_name": table_name,
+        },
     )
 
-    return result.scalar_one_or_none() is not None
+    return bool(result.scalar_one())
 
 
 async def _add_column_if_missing(
@@ -1944,6 +1997,12 @@ async def _add_column_if_missing(
         return
 
     if dialect == "postgresql":
+        if not await _postgres_table_exists(
+            connection,
+            table_name,
+        ):
+            return
+
         await connection.execute(
             text(
                 f'ALTER TABLE "{table_name}" '
@@ -1959,6 +2018,12 @@ async def _create_sqlite_index_if_missing(
     table_name: str,
     columns: str,
 ) -> None:
+    if not await _sqlite_table_exists(
+        connection,
+        table_name,
+    ):
+        return
+
     await connection.execute(
         text(
             f'CREATE INDEX IF NOT EXISTS "{index_name}" '
@@ -1973,6 +2038,12 @@ async def _create_postgres_index_if_missing(
     table_name: str,
     columns: str,
 ) -> None:
+    if not await _postgres_table_exists(
+        connection,
+        table_name,
+    ):
+        return
+
     await connection.execute(
         text(
             f'CREATE INDEX IF NOT EXISTS "{index_name}" '
@@ -1985,411 +2056,379 @@ async def run_migrations(connection) -> None:
     """
     Добавляет новые колонки в уже существующую БД.
 
-    Важно:
-        сначала create_all() создаёт новые таблицы,
-        затем сюда попадают старые таблицы.
+    Новые таблицы сначала создаются через create_all().
+    После этого миграции добавляют недостающие колонки
+    в старые таблицы.
 
-    Индексы на новые колонки создаются ПОСЛЕ миграций.
+    Миграции рассчитаны на SQLite и PostgreSQL.
     """
 
     dialect = connection.dialect.name
 
-    if dialect == "sqlite":
-        chat_members_exists = await _sqlite_table_exists(
+    # ========================================================================
+    # CHAT MEMBERS
+    # ========================================================================
+
+    chat_members_exists = (
+        await _sqlite_table_exists(
             connection,
             "chat_members",
         )
-
-        games_exists = await _sqlite_table_exists(
-            connection,
-            "games",
-        )
-
-        if chat_members_exists:
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "profile_nick",
-                "VARCHAR(32)",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "profile_tag",
-                "VARCHAR(32)",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "selected_tag_id",
-                "INTEGER",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "battle_pass_xp",
-                "INTEGER DEFAULT 0 NOT NULL",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "battle_pass_level",
-                "INTEGER DEFAULT 1 NOT NULL",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "battle_pass_season",
-                "INTEGER DEFAULT 1 NOT NULL",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "penis_size",
-                "FLOAT DEFAULT 0 NOT NULL",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "has_disease",
-                "BOOLEAN DEFAULT 0 NOT NULL",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "disease_since",
-                "DATETIME",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "next_disease_tick",
-                "DATETIME",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "has_child",
-                "BOOLEAN DEFAULT 0 NOT NULL",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "child_until",
-                "DATETIME",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "last_child_support",
-                "DATETIME",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "last_adult_rp_at",
-                "DATETIME",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "last_masturbation_at",
-                "DATETIME",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "last_rob_at",
-                "DATETIME",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "last_rubber_daily_bonus_at",
-                "DATETIME",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "last_message_at",
-                "DATETIME",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "chat_members",
-                "last_bonus_at",
-                "DATETIME",
-            )
-
-            await _create_sqlite_index_if_missing(
-                connection,
-                "ix_chat_members_chat_size",
-                "chat_members",
-                "chat_id, penis_size",
-            )
-
-            await _create_sqlite_index_if_missing(
-                connection,
-                "ix_chat_members_messages",
-                "chat_members",
-                "chat_id, messages",
-            )
-
-            await _create_sqlite_index_if_missing(
-                connection,
-                "ix_chat_members_balance",
-                "chat_members",
-                "chat_id, balance",
-            )
-
-            await _create_sqlite_index_if_missing(
-                connection,
-                "ix_chat_members_xp",
-                "chat_members",
-                "chat_id, xp",
-            )
-
-        if games_exists:
-            await _add_column_if_missing(
-                connection,
-                "games",
-                "player2_id",
-                "BIGINT",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "games",
-                "metadata_json",
-                "TEXT",
-            )
-
-            await _add_column_if_missing(
-                connection,
-                "games",
-                "finished_at",
-                "DATETIME",
-            )
-
-            await _create_sqlite_index_if_missing(
-                connection,
-                "ix_games_player2_id",
-                "games",
-                "player2_id",
-            )
-
-    elif dialect == "postgresql":
-        await _add_column_if_missing(
+        if dialect == "sqlite"
+        else await _postgres_table_exists(
             connection,
             "chat_members",
-            "profile_nick",
-            "VARCHAR(32)",
+        )
+    )
+
+    if chat_members_exists:
+        if dialect == "sqlite":
+            definitions = {
+                "profile_nick": "VARCHAR(32)",
+                "profile_tag": "VARCHAR(32)",
+                "selected_tag_id": "INTEGER",
+                "battle_pass_xp": "INTEGER DEFAULT 0 NOT NULL",
+                "battle_pass_level": "INTEGER DEFAULT 1 NOT NULL",
+                "battle_pass_season": "INTEGER DEFAULT 1 NOT NULL",
+                "penis_size": "FLOAT DEFAULT 0 NOT NULL",
+                "has_disease": "BOOLEAN DEFAULT 0 NOT NULL",
+                "disease_since": "DATETIME",
+                "next_disease_tick": "DATETIME",
+                "has_child": "BOOLEAN DEFAULT 0 NOT NULL",
+                "child_until": "DATETIME",
+                "last_child_support": "DATETIME",
+                "last_adult_rp_at": "DATETIME",
+                "last_masturbation_at": "DATETIME",
+                "last_rob_at": "DATETIME",
+                "last_rubber_daily_bonus_at": "DATETIME",
+                "last_message_at": "DATETIME",
+                "last_bonus_at": "DATETIME",
+            }
+        else:
+            definitions = {
+                "profile_nick": "VARCHAR(32)",
+                "profile_tag": "VARCHAR(32)",
+                "selected_tag_id": "INTEGER",
+                "battle_pass_xp": "INTEGER DEFAULT 0 NOT NULL",
+                "battle_pass_level": "INTEGER DEFAULT 1 NOT NULL",
+                "battle_pass_season": "INTEGER DEFAULT 1 NOT NULL",
+                "penis_size": "DOUBLE PRECISION DEFAULT 0 NOT NULL",
+                "has_disease": "BOOLEAN DEFAULT FALSE NOT NULL",
+                "disease_since": "TIMESTAMP",
+                "next_disease_tick": "TIMESTAMP",
+                "has_child": "BOOLEAN DEFAULT FALSE NOT NULL",
+                "child_until": "TIMESTAMP",
+                "last_child_support": "TIMESTAMP",
+                "last_adult_rp_at": "TIMESTAMP",
+                "last_masturbation_at": "TIMESTAMP",
+                "last_rob_at": "TIMESTAMP",
+                "last_rubber_daily_bonus_at": "TIMESTAMP",
+                "last_message_at": "TIMESTAMP",
+                "last_bonus_at": "TIMESTAMP",
+            }
+
+        for column_name, definition in definitions.items():
+            await _add_column_if_missing(
+                connection,
+                "chat_members",
+                column_name,
+                definition,
+            )
+
+        index_creator = (
+            _create_sqlite_index_if_missing
+            if dialect == "sqlite"
+            else _create_postgres_index_if_missing
         )
 
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "profile_tag",
-            "VARCHAR(32)",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "selected_tag_id",
-            "INTEGER",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "battle_pass_xp",
-            "INTEGER DEFAULT 0 NOT NULL",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "battle_pass_level",
-            "INTEGER DEFAULT 1 NOT NULL",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "battle_pass_season",
-            "INTEGER DEFAULT 1 NOT NULL",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "penis_size",
-            "DOUBLE PRECISION DEFAULT 0 NOT NULL",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "has_disease",
-            "BOOLEAN DEFAULT FALSE NOT NULL",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "disease_since",
-            "TIMESTAMP",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "next_disease_tick",
-            "TIMESTAMP",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "has_child",
-            "BOOLEAN DEFAULT FALSE NOT NULL",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "child_until",
-            "TIMESTAMP",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "last_child_support",
-            "TIMESTAMP",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "last_adult_rp_at",
-            "TIMESTAMP",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "last_masturbation_at",
-            "TIMESTAMP",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "last_rob_at",
-            "TIMESTAMP",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "last_rubber_daily_bonus_at",
-            "TIMESTAMP",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "last_message_at",
-            "TIMESTAMP",
-        )
-
-        await _add_column_if_missing(
-            connection,
-            "chat_members",
-            "last_bonus_at",
-            "TIMESTAMP",
-        )
-
-        await _create_postgres_index_if_missing(
+        await index_creator(
             connection,
             "ix_chat_members_chat_size",
             "chat_members",
             "chat_id, penis_size",
         )
 
-        await _create_postgres_index_if_missing(
+        await index_creator(
             connection,
             "ix_chat_members_messages",
             "chat_members",
             "chat_id, messages",
         )
 
-        await _create_postgres_index_if_missing(
+        await index_creator(
             connection,
             "ix_chat_members_balance",
             "chat_members",
             "chat_id, balance",
         )
 
-        await _create_postgres_index_if_missing(
+        await index_creator(
             connection,
             "ix_chat_members_xp",
             "chat_members",
             "chat_id, xp",
         )
 
-        await _add_column_if_missing(
+    # ========================================================================
+    # GAMES
+    # ========================================================================
+
+    games_exists = (
+        await _sqlite_table_exists(
             connection,
             "games",
-            "player2_id",
-            "BIGINT",
         )
-
-        await _add_column_if_missing(
+        if dialect == "sqlite"
+        else await _postgres_table_exists(
             connection,
             "games",
-            "metadata_json",
-            "TEXT",
+        )
+    )
+
+    if games_exists:
+        definitions = (
+            {
+                "player2_id": "BIGINT",
+                "metadata_json": "TEXT",
+                "finished_at": "DATETIME",
+            }
+            if dialect == "sqlite"
+            else {
+                "player2_id": "BIGINT",
+                "metadata_json": "TEXT",
+                "finished_at": "TIMESTAMP",
+            }
         )
 
-        await _add_column_if_missing(
-            connection,
-            "games",
-            "finished_at",
-            "TIMESTAMP",
+        for column_name, definition in definitions.items():
+            await _add_column_if_missing(
+                connection,
+                "games",
+                column_name,
+                definition,
+            )
+
+        index_creator = (
+            _create_sqlite_index_if_missing
+            if dialect == "sqlite"
+            else _create_postgres_index_if_missing
         )
 
-        await _create_postgres_index_if_missing(
+        await index_creator(
             connection,
             "ix_games_player2_id",
             "games",
             "player2_id",
         )
 
+    # ========================================================================
+    # GIVEAWAY PARTICIPANTS
+    # ========================================================================
+
+    participants_exists = (
+        await _sqlite_table_exists(
+            connection,
+            "giveaway_participants",
+        )
+        if dialect == "sqlite"
+        else await _postgres_table_exists(
+            connection,
+            "giveaway_participants",
+        )
+    )
+
+    giveaways_exists = (
+        await _sqlite_table_exists(
+            connection,
+            "giveaways",
+        )
+        if dialect == "sqlite"
+        else await _postgres_table_exists(
+            connection,
+            "giveaways",
+        )
+    )
+
+    if participants_exists:
+        chat_definition = (
+            "BIGINT"
+        )
+
+        await _add_column_if_missing(
+            connection,
+            "giveaway_participants",
+            "chat_id",
+            chat_definition,
+        )
+
+        # Старые записи получают chat_id из связанного giveaway.
+        if giveaways_exists:
+            await connection.execute(
+                text(
+                    """
+                    UPDATE giveaway_participants
+                    SET chat_id = (
+                        SELECT giveaways.chat_id
+                        FROM giveaways
+                        WHERE giveaways.id = giveaway_participants.giveaway_id
+                    )
+                    WHERE chat_id IS NULL
+                    """
+                )
+            )
+
+        index_creator = (
+            _create_sqlite_index_if_missing
+            if dialect == "sqlite"
+            else _create_postgres_index_if_missing
+        )
+
+        await index_creator(
+            connection,
+            "ix_giveaway_participants_chat_id",
+            "giveaway_participants",
+            "chat_id",
+        )
+
+    # ========================================================================
+    # MODERATION PERMISSION COMPATIBILITY
+    # ========================================================================
+
+    permissions_exists = (
+        await _sqlite_table_exists(
+            connection,
+            "mod_permissions",
+        )
+        if dialect == "sqlite"
+        else await _postgres_table_exists(
+            connection,
+            "mod_permissions",
+        )
+    )
+
+    if permissions_exists:
+        if dialect == "sqlite":
+            await _add_column_if_missing(
+                connection,
+                "mod_permissions",
+                "required_role",
+                "VARCHAR(32) DEFAULT 'staff' NOT NULL",
+            )
+        else:
+            await _add_column_if_missing(
+                connection,
+                "mod_permissions",
+                "required_role",
+                "VARCHAR(32) DEFAULT 'staff' NOT NULL",
+            )
+
+        columns = await _column_names(
+            connection,
+            "mod_permissions",
+        )
+
+        if "scope" in columns and "required_role" in columns:
+            await connection.execute(
+                text(
+                    """
+                    UPDATE mod_permissions
+                    SET required_role = scope
+                    WHERE required_role IS NULL
+                       OR required_role = ''
+                    """
+                )
+            )
+
+    # ========================================================================
+    # GIVEAWAY COMPATIBILITY
+    # ========================================================================
+
+    if giveaways_exists:
+        await _add_column_if_missing(
+            connection,
+            "giveaways",
+            "prize_external",
+            "TEXT",
+        )
+
+        await _add_column_if_missing(
+            connection,
+            "giveaways",
+            "winner_user_id",
+            "BIGINT",
+        )
+
+        if dialect == "sqlite":
+            await _add_column_if_missing(
+                connection,
+                "giveaways",
+                "finished_at",
+                "DATETIME",
+            )
+        else:
+            await _add_column_if_missing(
+                connection,
+                "giveaways",
+                "finished_at",
+                "TIMESTAMP",
+            )
+
+        columns = await _column_names(
+            connection,
+            "giveaways",
+        )
+
+        if (
+            "prize_description" in columns
+            and "prize_external" in columns
+        ):
+            await connection.execute(
+                text(
+                    """
+                    UPDATE giveaways
+                    SET prize_external = prize_description
+                    WHERE prize_external IS NULL
+                    """
+                )
+            )
+
+        if (
+            "winner_id" in columns
+            and "winner_user_id" in columns
+        ):
+            await connection.execute(
+                text(
+                    """
+                    UPDATE giveaways
+                    SET winner_user_id = winner_id
+                    WHERE winner_user_id IS NULL
+                    """
+                )
+            )
+
+        if (
+            "completed_at" in columns
+            and "finished_at" in columns
+        ):
+            await connection.execute(
+                text(
+                    """
+                    UPDATE giveaways
+                    SET finished_at = completed_at
+                    WHERE finished_at IS NULL
+                    """
+                )
+            )
+
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
 
 async def initialize_database() -> None:
     """
-    Создаёт таблицы и затем выполняет совместимые миграции.
+    Создаёт таблицы и выполняет совместимые миграции.
     """
 
     async with engine.begin() as connection:
@@ -2397,7 +2436,9 @@ async def initialize_database() -> None:
             Base.metadata.create_all
         )
 
-        await run_migrations(connection)
+        await run_migrations(
+            connection,
+        )
 
 
 async def close_database() -> None:
@@ -2419,8 +2460,28 @@ async def delete_chat_data(
     Используется только административными процедурами.
     """
 
+    # Участники giveaway не имеют собственного chat_id в старых БД,
+    # поэтому удаляем их через giveaway_id.
+    giveaway_ids_result = await session.execute(
+        select(Giveaway.id).where(
+            Giveaway.chat_id == chat_id,
+        )
+    )
+
+    giveaway_ids = list(
+        giveaway_ids_result.scalars().all()
+    )
+
+    if giveaway_ids:
+        await session.execute(
+            GiveawayParticipant.__table__.delete().where(
+                GiveawayParticipant.giveaway_id.in_(
+                    giveaway_ids
+                )
+            )
+        )
+
     tables = [
-        GiveawayParticipant,
         Giveaway,
         BattlePassRewardClaim,
         UserTag,
@@ -2435,13 +2496,9 @@ async def delete_chat_data(
         EconomyTransaction,
         ChatMember,
         ChatSettings,
-        Chat,
     ]
 
     for model in tables:
-        if model is Chat:
-            continue
-
         if hasattr(model, "chat_id"):
             await session.execute(
                 model.__table__.delete().where(
