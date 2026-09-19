@@ -4,8 +4,7 @@ Ezzzy Game Bot
 
 services.py — бизнес-логика приложения.
 
-Основные подсистемы:
-
+Здесь находятся:
     - экономика;
     - XP / уровни;
     - Battle Pass;
@@ -15,30 +14,28 @@ services.py — бизнес-логика приложения.
     - ежедневный бонус;
     - переводы;
     - мини-игры;
-    - крестики-нолики;
+    - TTT;
     - football / basketball;
     - RP;
     - размер;
     - rob;
     - болезнь;
-    - беременность / ребёнок;
+    - ребёнок;
     - инвентарь;
     - кейсы;
     - модерация;
     - staff roles;
-    - owner-команды.
+    - owner/admin-команды.
 
-ВАЖНО:
-
-Telegram handlers должны заниматься Telegram-взаимодействием,
-а эта таблица — бизнес-логикой и изменением состояния БД.
+Handlers отвечают за Telegram.
+Services отвечают за правила игры и БД.
 """
 
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from html import escape
 from typing import Optional
 
@@ -59,14 +56,71 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core import (
     ADULT_RP_COST,
+    BATTLE_PASS_MAX_LEVEL,
+    BATTLE_PASS_REWARDS,
     CURRENCY_SYMBOL,
+    DEFAULT_MODERATION_PERMISSIONS,
     LEVEL_UNLOCKS,
     NORMAL_RP_COST,
     RP_ACTIONS,
+    TAG_DISPLAY_NAMES,
+    TAG_LIVING_LEGEND,
+    get_adult_rp_action,
     get_config,
+    get_feature_required_level,
+    get_rp_action_by_alias,
     level_from_xp,
     xp_for_level,
     xp_to_next_level,
+    ADULT_RP_SIZE_GAIN_MIN,
+    ADULT_RP_SIZE_GAIN_MAX,
+    ADULT_RP_TARGET_SIZE_LOSS_MIN,
+    ADULT_RP_TARGET_SIZE_LOSS_MAX,
+    RUBBER_DAILY_GROWTH_CHANCE,
+    RUBBER_DAILY_GROWTH_AMOUNT,
+    RUBBER_MASTURBATION_GAIN_MIN,
+    RUBBER_MASTURBATION_GAIN_MAX,
+    DISEASE_CONTRACT_CHANCE,
+    DISEASE_SIZE_LOSS_PER_TICK,
+    DISEASE_MEDICINE_COST,
+    VENEREOLOGIST_COST,
+    VENEREOLOGIST_CURE_CHANCE,
+    IMPREGNATION_CHANCE_WITHOUT_CONDOM,
+    IMPREGNATION_CHANCE_WITH_CONDOM,
+    CHILD_DURATION_HOURS,
+    CHILD_SUPPORT_PER_HOUR,
+    ABORT_COST,
+    ABORT_SUCCESS_CHANCE,
+    CONDOM_ITEM_CODE,
+    CONDOM_DISEASE_PROTECTION_CHANCE,
+    LUBRICANT_ITEM_CODE,
+    LUBRICANT_GROWTH_BONUS,
+    DILDO_ITEM_CODE,
+    DILDO_MIN_USES,
+    DILDO_MAX_USES,
+    DILDO_DUPLICATE_COMPENSATION,
+    DILDO_MAX_OWNED,
+    RUBBER_PUSSY_ITEM_CODE,
+    RUBBER_PUSSY_COOLDOWN_MULTIPLIER,
+    RUBBER_PUSSY_DAILY_CHANCE,
+    RUBBER_PUSSY_DAILY_BONUS,
+    RUBBER_PUSSY_MASTURBATION_MIN,
+    RUBBER_PUSSY_MASTURBATION_MAX,
+    SILICONE_IMPLANT_ITEM_CODE,
+    SILICONE_IMPLANT_BONUS,
+    ROB_MIN_SUCCESS_CHANCE,
+    ROB_MAX_SUCCESS_CHANCE,
+    ROB_MIN_REWARD_PERCENT,
+    ROB_MAX_REWARD_PERCENT,
+    ROB_COOLDOWN_SECONDS,
+    ROLE_OWNER,
+    ROLE_HEAD_ADMIN,
+    ROLE_ADMIN,
+    ROLE_MODERATOR,
+    ROLE_POWER,
+    MODERATION_PERMISSION_LEVEL,
+    can_manage_role,
+    can_use_moderation_command,
 )
 
 from database import (
@@ -94,11 +148,14 @@ from database import (
     get_or_create_chat,
     get_or_create_member,
     get_or_create_user,
+    get_staff_member,
+    get_staff_role,
     get_tag_by_code,
     get_top_by_balance,
     get_top_by_messages,
     get_top_by_penis_size,
     get_top_by_xp,
+    get_user_item,
     get_user_items,
     get_user_tags,
     utcnow,
@@ -132,54 +189,46 @@ RNG = random.SystemRandom()
 
 MAX_PROFILE_NICK_LENGTH = 32
 
-STAFF_OWNER = "owner"
-STAFF_HEAD_ADMIN = "head_admin"
-STAFF_ADMIN = "admin"
-STAFF_MODERATOR = "moderator"
-
-STAFF_POWER = {
-    STAFF_OWNER: 40,
-    STAFF_HEAD_ADMIN: 30,
-    STAFF_ADMIN: 20,
-    STAFF_MODERATOR: 10,
-}
+STAFF_OWNER = ROLE_OWNER
+STAFF_HEAD_ADMIN = ROLE_HEAD_ADMIN
+STAFF_ADMIN = ROLE_ADMIN
+STAFF_MODERATOR = ROLE_MODERATOR
 
 PERMISSION_STAFF = "staff"
 PERMISSION_ADMIN = "admin"
 PERMISSION_HEAD_ADMIN = "head_admin"
+
+BP_XP_PER_LEVEL = 100
+BP_MAX_LEVEL = BATTLE_PASS_MAX_LEVEL
+
+SIZE_LEVEL_REWARD = 0.10
+
+ADULT_RP_COOLDOWN = 15 * 60
+MASTURBATION_COOLDOWN = 6 * 60 * 60
+
+NORMAL_RP_COST_VALUE = NORMAL_RP_COST
+ADULT_RP_COST_VALUE = ADULT_RP_COST
+
+ROB_COOLDOWN = ROB_COOLDOWN_SECONDS
+
+DISEASE_TICK_INTERVAL = 60 * 60
+
+CHILD_DURATION = CHILD_DURATION_HOURS * 60 * 60
+CHILD_SUPPORT_COST = CHILD_SUPPORT_PER_HOUR
+ABORT_COST_VALUE = ABORT_COST
 
 GAME_FEATURES = {
     "coinflip": "coinflip",
     "dice": "dice",
     "slots": "slots",
     "roulette": "roulette",
+    "guess": "guess",
     "football": "football",
     "basketball": "basketball",
     "tictactoe": "tictactoe",
     "blackjack": "blackjack",
     "crash": "crash",
 }
-
-BP_XP_PER_LEVEL = 100
-BP_MAX_LEVEL = 30
-
-SIZE_LEVEL_REWARD = 0.10
-
-ADULT_RP_COOLDOWN = 15 * 60
-MASTURBATION_COOLDOWN = 6 * 60 * 60
-ROB_COOLDOWN = 24 * 60 * 60
-
-DISEASE_TICK_INTERVAL = 60 * 60
-DISEASE_SIZE_LOSS = 0.5
-DISEASE_MEDICINE_COST = 500
-VENEREOLOGIST_COST = 5000
-
-CHILD_DURATION = 18 * 60 * 60
-CHILD_SUPPORT_COST = 10_000
-ABORT_COST = 30_000
-
-NORMAL_RP_COST_VALUE = 10
-ADULT_RP_COST_VALUE = 50
 
 
 # ============================================================================
@@ -212,6 +261,10 @@ def now_utc() -> datetime:
     return utcnow()
 
 
+def normalize_text(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
 async def get_member(
     session: AsyncSession,
     chat_id: int,
@@ -236,7 +289,6 @@ async def ensure_member(
     last_name: Optional[str] = None,
     is_bot: bool = False,
 ) -> ChatMember:
-
     await get_or_create_user(
         session=session,
         user_id=user_id,
@@ -246,13 +298,11 @@ async def ensure_member(
         is_bot=is_bot,
     )
 
-    member = await get_or_create_member(
+    return await get_or_create_member(
         session=session,
         chat_id=chat_id,
         user_id=user_id,
     )
-
-    return member
 
 
 def valid_bet(bet: int) -> Optional[str]:
@@ -277,7 +327,6 @@ async def can_afford(
     user_id: int,
     amount: int,
 ) -> tuple[Optional[ChatMember], Optional[str]]:
-
     member = await get_member(
         session,
         chat_id,
@@ -312,7 +361,6 @@ async def change_balance(
     transaction_type: str,
     description: Optional[str] = None,
 ) -> ChatMember:
-
     member = await get_member(
         session,
         chat_id,
@@ -351,6 +399,42 @@ async def change_balance(
     return member
 
 
+def cooldown_remaining(
+    last_at: Optional[datetime],
+    cooldown_seconds: float,
+) -> int:
+    if last_at is None:
+        return 0
+
+    elapsed = (utcnow() - last_at).total_seconds()
+
+    return max(
+        0,
+        int(cooldown_seconds - elapsed),
+    )
+
+
+def format_seconds(seconds: int) -> str:
+    if seconds <= 0:
+        return "сейчас"
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    parts = []
+
+    if hours:
+        parts.append(f"{hours} ч.")
+
+    if minutes:
+        parts.append(f"{minutes} мин.")
+
+    if not hours and secs:
+        parts.append(f"{secs} сек.")
+
+    return " ".join(parts)
+
+
 # ============================================================================
 # TARGET RESOLUTION
 # ============================================================================
@@ -363,6 +447,13 @@ async def resolve_target(
     target_username: Optional[str] = None,
     fallback_user_id: Optional[int] = None,
 ) -> Optional[User]:
+    """
+    Приоритет:
+
+        1. target_user_id — reply/text_mention;
+        2. username;
+        3. fallback_user_id.
+    """
 
     if target_user_id is not None:
         return await session.get(
@@ -393,23 +484,144 @@ async def resolve_target(
     return None
 
 
+async def resolve_member_target(
+    session: AsyncSession,
+    chat_id: int,
+    target_user_id: int,
+) -> tuple[Optional[User], Optional[ChatMember]]:
+    user = await session.get(
+        User,
+        target_user_id,
+    )
+
+    member = await get_member(
+        session,
+        chat_id,
+        target_user_id,
+    )
+
+    return user, member
+
+
 # ============================================================================
 # MESSAGE / XP / BATTLE PASS
 # ============================================================================
+
+
+async def grant_tag(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+    tag_code: str,
+    earned_from: str,
+) -> Optional[Tag]:
+    tag = await get_tag_by_code(
+        session,
+        tag_code,
+    )
+
+    if tag is None:
+        tag = Tag(
+            code=tag_code,
+            name=TAG_DISPLAY_NAMES.get(
+                tag_code,
+                tag_code,
+            ),
+            description=f"Получен через {earned_from}.",
+        )
+        session.add(tag)
+        await session.flush()
+
+    existing = await session.execute(
+        select(UserTag).where(
+            UserTag.chat_id == chat_id,
+            UserTag.user_id == user_id,
+            UserTag.tag_id == tag.id,
+        )
+    )
+
+    if existing.scalar_one_or_none() is None:
+        session.add(
+            UserTag(
+                chat_id=chat_id,
+                user_id=user_id,
+                tag_id=tag.id,
+                earned_from=earned_from,
+            )
+        )
+        await session.flush()
+
+    return tag
+
+
+async def grant_item(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+    item_code: str,
+    quantity: int = 1,
+) -> Optional[UserItem]:
+    if quantity <= 0:
+        return None
+
+    item = await get_inventory_item(
+        session,
+        item_code,
+    )
+
+    if item is None:
+        return None
+
+    user_item = await get_user_item(
+        session,
+        chat_id,
+        user_id,
+        item_code,
+    )
+
+    if user_item is None:
+        uses_left = None
+
+        if item_code == DILDO_ITEM_CODE:
+            uses_left = RNG.randint(
+                DILDO_MIN_USES,
+                DILDO_MAX_USES,
+            )
+
+        user_item = UserItem(
+            chat_id=chat_id,
+            user_id=user_id,
+            item_id=item.id,
+            quantity=quantity,
+            uses_left=uses_left,
+        )
+
+        session.add(user_item)
+    else:
+        if item.max_quantity is not None:
+            user_item.quantity = min(
+                item.max_quantity,
+                user_item.quantity + quantity,
+            )
+        else:
+            user_item.quantity += quantity
+
+    await session.flush()
+
+    return user_item
 
 
 async def _process_battle_pass(
     session: AsyncSession,
     member: ChatMember,
 ) -> list[str]:
-
     old_level = member.battle_pass_level
 
     member.battle_pass_xp += 1
 
     new_level = min(
         BP_MAX_LEVEL,
-        (member.battle_pass_xp // BP_XP_PER_LEVEL) + 1,
+        1 + member.battle_pass_xp // BP_XP_PER_LEVEL,
     )
 
     if new_level <= old_level:
@@ -417,14 +629,7 @@ async def _process_battle_pass(
 
     member.battle_pass_level = new_level
 
-    rewards: list[str] = []
-
-    # Награды берутся из core.BATTLE_PASS_REWARDS,
-    # если такая структура присутствует.
-    try:
-        from core import BATTLE_PASS_REWARDS
-    except ImportError:
-        BATTLE_PASS_REWARDS = {}
+    reward_messages: list[str] = []
 
     for level in range(
         old_level + 1,
@@ -434,19 +639,6 @@ async def _process_battle_pass(
 
         if reward is None:
             continue
-
-        reward_code = getattr(
-            reward,
-            "code",
-            None,
-        ) or getattr(
-            reward,
-            "reward_code",
-            None,
-        )
-
-        if not reward_code:
-            reward_code = str(reward)
 
         existing = await session.execute(
             select(BattlePassRewardClaim).where(
@@ -460,6 +652,12 @@ async def _process_battle_pass(
         if existing.scalar_one_or_none():
             continue
 
+        reward_code = (
+            reward.item_code
+            or reward.tag_code
+            or reward.reward_type
+        )
+
         session.add(
             BattlePassRewardClaim(
                 chat_id=member.chat_id,
@@ -470,18 +668,54 @@ async def _process_battle_pass(
             )
         )
 
-        rewards.append(
-            f"уровень {level}: {escape(str(reward_code))}"
+        reward_text = reward.description
+
+        if reward.reward_type == "peanuts":
+            await change_balance(
+                session,
+                member.chat_id,
+                member.user_id,
+                reward.amount,
+                "battle_pass_reward",
+                f"Battle Pass уровень {level}",
+            )
+
+        elif reward.reward_type == "xp":
+            member.xp += reward.amount
+            member.level = level_from_xp(
+                member.xp
+            )
+
+        elif reward.reward_type == "case":
+            if reward.item_code:
+                await grant_item(
+                    session,
+                    member.chat_id,
+                    member.user_id,
+                    reward.item_code,
+                )
+
+        elif reward.reward_type == "tag":
+            if reward.tag_code:
+                await grant_tag(
+                    session,
+                    member.chat_id,
+                    member.user_id,
+                    reward.tag_code,
+                    f"battle_pass:{level}",
+                )
+
+        reward_messages.append(
+            f"• {level} — {escape(reward_text)}"
         )
 
-    return rewards
+    return reward_messages
 
 
 async def handle_message(
     session: AsyncSession,
     message: Message,
 ) -> ServiceResult:
-
     if not message.from_user:
         return ServiceResult(
             success=False,
@@ -520,14 +754,11 @@ async def handle_message(
 
     old_level = member.level
 
-    # ------------------------------------------------------------------------
-    # MESSAGE XP
-    # ------------------------------------------------------------------------
-
     member.messages += 1
 
+    # ВАЖНО:
     # 1 сообщение = +1 XP.
-    # Никакого cooldown.
+    # Cooldown здесь отсутствует намеренно.
     member.xp += config.message_xp
 
     new_level = level_from_xp(
@@ -537,21 +768,12 @@ async def handle_message(
     if new_level > old_level:
         member.level = new_level
 
-    # ------------------------------------------------------------------------
-    # BATTLE PASS
-    # ------------------------------------------------------------------------
-
-    # 1 сообщение = +1 BP XP.
-    # Также без cooldown.
     bp_rewards = await _process_battle_pass(
         session,
         member,
     )
 
-    # ------------------------------------------------------------------------
-    # MESSAGE REWARD
-    # ------------------------------------------------------------------------
-
+    # Денежная награда за сообщение имеет отдельный cooldown.
     reward_allowed = True
 
     if member.last_message_at is not None:
@@ -571,28 +793,20 @@ async def handle_message(
             config.message_reward_max,
         )
 
-        member.balance += reward
-
-        await add_transaction(
-            session=session,
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            amount=reward,
-            balance_after=member.balance,
-            transaction_type="message_reward",
-            description="Награда за сообщение",
+        await change_balance(
+            session,
+            message.chat.id,
+            message.from_user.id,
+            reward,
+            "message_reward",
+            "Награда за сообщение",
         )
 
         member.last_message_at = now
 
-    # ------------------------------------------------------------------------
-    # LEVEL SIZE
-    # ------------------------------------------------------------------------
-
     level_up_message = None
 
     if new_level > old_level:
-
         levels_gained = new_level - old_level
 
         member.penis_size = round(
@@ -642,30 +856,27 @@ async def handle_message(
             f"{unlock_text}"
         )
 
-    # ------------------------------------------------------------------------
-    # BP MESSAGE
-    # ------------------------------------------------------------------------
-
     if bp_rewards:
-        bp_text = (
-            "\n\n🎫 <b>Battle Pass</b>\n"
-            f"Уровень: <b>{member.battle_pass_level}</b>"
-        )
-
-        if member.battle_pass_level >= BP_MAX_LEVEL:
-            bp_text += (
-                "\n🏆 <b>ЖИВАЯ ЛЕГЕНДА</b>"
-            )
-
         if level_up_message:
-            level_up_message += bp_text
+            level_up_message += (
+                "\n\n🎫 <b>Battle Pass</b>\n"
+                f"Уровень: <b>{member.battle_pass_level}</b>\n"
+                + "\n".join(bp_rewards)
+            )
         else:
             level_up_message = (
                 f"🎫 {user_mention("
                     message.from_user.id,
                     clean_name(user),
-                )}"
-                f"{bp_text}"
+                )}\n"
+                f"<b>Battle Pass {member.battle_pass_level}</b>\n"
+                + "\n".join(bp_rewards)
+            )
+
+    if member.battle_pass_level >= BP_MAX_LEVEL:
+        if level_up_message:
+            level_up_message += (
+                "\n\n🏆 <b>ЖИВАЯ ЛЕГЕНДА</b>"
             )
 
     member.updated_at = now
@@ -689,7 +900,6 @@ async def _selected_tag(
     session: AsyncSession,
     member: ChatMember,
 ) -> Optional[Tag]:
-
     if member.selected_tag_id is None:
         return None
 
@@ -704,7 +914,6 @@ async def format_profile(
     chat_id: int,
     user_id: int,
 ) -> str:
-
     member = await get_member(
         session,
         chat_id,
@@ -793,17 +1002,16 @@ async def format_profile(
 
     return (
         f"👤 <b>{escape(name)}</b>\n"
-        f"{tag_text}\n\n"
+        f"{tag_text}\n"
         f"⭐ Уровень: <b>{member.level}</b>\n"
         f"✨ XP: <b>{format_balance(member.xp)}</b>\n"
         f"{bar} {progress_percent}%\n"
         f"📈 До следующего уровня: "
-        f"<b>{format_balance(xp_to_next_level(member.xp))}</b> XP\n\n"
+        f"<b>{format_balance(xp_to_next_level(member.xp))}</b>\n\n"
         f"🎫 Battle Pass: "
         f"<b>{member.battle_pass_level}/{BP_MAX_LEVEL}</b>\n"
-        f"🎫 BP XP: <b>{member.battle_pass_xp}</b>\n\n"
-        f"🥜 Арахис: <b>{format_balance(member.balance)}</b>\n"
         f"📏 Размер: <b>{member.penis_size:.2f} см</b>\n"
+        f"🥜 Баланс: <b>{format_balance(member.balance)}</b>\n"
         f"💬 Сообщений: <b>{format_balance(member.messages)}</b>\n"
         f"🎮 Игр: <b>{format_balance(member.games_played)}</b>\n"
         f"🏆 Побед: <b>{format_balance(member.games_won)}</b>\n"
@@ -818,7 +1026,6 @@ async def format_stats(
     chat_id: int,
     user_id: int,
 ) -> str:
-
     member = await get_member(
         session,
         chat_id,
@@ -826,35 +1033,30 @@ async def format_stats(
     )
 
     if member is None:
-        return "❌ Профиль ещё не создан."
-
-    total_games = (
-        member.games_won
-        + member.games_lost
-    )
-
-    winrate = (
-        member.games_won
-        / total_games
-        * 100
-        if total_games
-        else 0
-    )
+        return "❌ Профиль не найден."
 
     return (
-        "📊 <b>Твоя статистика</b>\n\n"
+        "📊 <b>Статистика</b>\n\n"
         f"💬 Сообщений: <b>{format_balance(member.messages)}</b>\n"
         f"⭐ XP: <b>{format_balance(member.xp)}</b>\n"
-        f"🏅 Уровень: <b>{member.level}</b>\n"
-        f"🎫 BP: <b>{member.battle_pass_level}</b>\n"
-        f"🥜 Баланс: <b>{format_balance(member.balance)}</b>\n"
-        f"📏 Размер: <b>{member.penis_size:.2f} см</b>\n\n"
         f"🎮 Игр: <b>{format_balance(member.games_played)}</b>\n"
         f"🏆 Побед: <b>{format_balance(member.games_won)}</b>\n"
         f"💀 Поражений: <b>{format_balance(member.games_lost)}</b>\n"
-        f"📈 Винрейт: <b>{winrate:.1f}%</b>\n"
-        f"💰 Выиграно: <b>{format_balance(member.total_won)}</b> 🥜\n"
-        f"💸 Проиграно: <b>{format_balance(member.total_lost)}</b> 🥜"
+        f"📈 Выиграно: <b>{format_balance(member.total_won)}</b> 🥜\n"
+        f"📉 Проиграно: <b>{format_balance(member.total_lost)}</b> 🥜\n"
+        f"📏 Размер: <b>{member.penis_size:.2f} см</b>"
+    )
+
+
+async def format_other_profile(
+    session: AsyncSession,
+    chat_id: int,
+    target_user_id: int,
+) -> str:
+    return await format_profile(
+        session,
+        chat_id,
+        target_user_id,
     )
 
 
@@ -863,6 +1065,39 @@ async def balance_user(
     chat_id: int,
     user_id: int,
 ) -> int:
+    member = await get_member(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    if member is None:
+        member = await ensure_member(
+            session,
+            chat_id,
+            user_id,
+        )
+
+    return member.balance
+
+
+# ============================================================================
+# TAGS
+# ============================================================================
+
+
+async def get_tag_keyboard(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+) -> InlineKeyboardMarkup:
+    tags = await get_user_tags(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    builder = InlineKeyboardBuilder()
 
     member = await get_member(
         session,
@@ -870,19 +1105,125 @@ async def balance_user(
         user_id,
     )
 
-    return member.balance if member else 0
+    selected_id = (
+        member.selected_tag_id
+        if member
+        else None
+    )
+
+    for user_tag in tags:
+        tag = user_tag.tag
+
+        if tag is None:
+            continue
+
+        prefix = "✅ " if tag.id == selected_id else ""
+
+        builder.button(
+            text=prefix + tag.name,
+            callback_data=f"tagselect:{tag.id}",
+        )
+
+    builder.adjust(1)
+
+    return builder.as_markup()
 
 
-# ============================================================================
-# DAILY BONUS
-# ============================================================================
-
-
-async def claim_daily_bonus(
+async def select_tag(
     session: AsyncSession,
     chat_id: int,
     user_id: int,
+    tag_id: int,
 ) -> ServiceResult:
+    member = await get_member(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    if member is None:
+        return ServiceResult(
+            False,
+            "❌ Профиль не найден.",
+        )
+
+    result = await session.execute(
+        select(UserTag).where(
+            UserTag.chat_id == chat_id,
+            UserTag.user_id == user_id,
+            UserTag.tag_id == tag_id,
+        )
+    )
+
+    user_tag = result.scalar_one_or_none()
+
+    if user_tag is None:
+        return ServiceResult(
+            False,
+            "❌ У тебя нет этого тега.",
+            answer="У тебя нет этого тега.",
+            show_alert=True,
+        )
+
+    tag = await session.get(
+        Tag,
+        tag_id,
+    )
+
+    if tag is None:
+        return ServiceResult(
+            False,
+            "❌ Тег не найден.",
+        )
+
+    member.selected_tag_id = tag.id
+    member.profile_tag = tag.name
+
+    await session.flush()
+
+    return ServiceResult(
+        True,
+        f"🏷 Выбран тег: <b>{escape(tag.name)}</b>",
+        changed=True,
+    )
+
+
+async def set_profile_tag(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+    tag: str,
+) -> ServiceResult:
+    """
+    Старый /settag намеренно больше НЕ позволяет
+    пользователю создавать произвольный тег.
+
+    Оставляем функцию ради совместимости handlers.
+    """
+
+    return ServiceResult(
+        False,
+        (
+            "❌ Самостоятельно устанавливать тег нельзя.\n"
+            "🏷 Теги выдаются через игровые награды, кейсы "
+            "и Battle Pass.\n\n"
+            "Используй <code>/tag</code>, чтобы выбрать "
+            "полученный тег."
+        ),
+    )
+
+
+async def set_profile_nick(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+    nick: str,
+) -> ServiceResult:
+    if len(nick) > MAX_PROFILE_NICK_LENGTH:
+        return ServiceResult(
+            False,
+            f"❌ Ник не должен быть длиннее {MAX_PROFILE_NICK_LENGTH} символов.",
+        )
 
     member = await get_member(
         session,
@@ -897,29 +1238,120 @@ async def claim_daily_bonus(
             user_id,
         )
 
-    now = utcnow()
+    member.profile_nick = nick
+    await session.flush()
 
-    if member.last_bonus_at:
-        elapsed = (
-            now - member.last_bonus_at
-        ).total_seconds()
+    return ServiceResult(
+        True,
+        f"✏️ Ник изменён на <b>{escape(nick)}</b>.",
+        changed=True,
+    )
 
-        if elapsed < 86400:
-            remaining = int(
-                86400 - elapsed
+
+# ============================================================================
+# LEADERBOARDS
+# ============================================================================
+
+
+async def get_leaderboard(
+    session: AsyncSession,
+    chat_id: int,
+) -> str:
+    balance_top = await get_top_by_balance(
+        session,
+        chat_id,
+        5,
+    )
+
+    xp_top = await get_top_by_xp(
+        session,
+        chat_id,
+        5,
+    )
+
+    size_top = await get_top_by_penis_size(
+        session,
+        chat_id,
+        5,
+    )
+
+    def render(
+        title: str,
+        members: list[ChatMember],
+        value,
+    ) -> str:
+        lines = [title]
+
+        for index, member in enumerate(
+            members,
+            1,
+        ):
+            lines.append(
+                f"{index}. <a href=\"tg://user?id={member.user_id}\">"
+                f"Игрок</a> — <b>{value(member)}</b>"
             )
 
-            hours = remaining // 3600
-            minutes = (
-                remaining % 3600
-            ) // 60
+        return "\n".join(lines)
+
+    return (
+        render(
+            "🥜 <b>Топ по арахису</b>",
+            balance_top,
+            lambda m: format_balance(m.balance),
+        )
+        + "\n\n"
+        + render(
+            "⭐ <b>Топ по XP</b>",
+            xp_top,
+            lambda m: format_balance(m.xp),
+        )
+        + "\n\n"
+        + render(
+            "📏 <b>Топ по размеру</b>",
+            size_top,
+            lambda m: f"{m.penis_size:.2f} см",
+        )
+    )
+
+
+# ============================================================================
+# DAILY BONUS
+# ============================================================================
+
+
+async def claim_daily_bonus(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+) -> ServiceResult:
+    member = await get_member(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    if member is None:
+        member = await ensure_member(
+            session,
+            chat_id,
+            user_id,
+        )
+
+    if member.last_bonus_at is not None:
+        elapsed = (
+            utcnow() - member.last_bonus_at
+        ).total_seconds()
+
+        if elapsed < 24 * 60 * 60:
+            remaining = int(
+                24 * 60 * 60 - elapsed
+            )
 
             return ServiceResult(
                 False,
                 (
-                    "⏳ Ты уже получил ежедневный бонус.\n"
-                    f"Следующий будет через "
-                    f"<b>{hours} ч. {minutes} мин.</b>"
+                    "⏳ Бонус уже получен.\n"
+                    f"Следующий через <b>{format_seconds(remaining)}</b>."
                 ),
             )
 
@@ -928,180 +1360,24 @@ async def claim_daily_bonus(
         config.daily_bonus_max,
     )
 
-    member.last_bonus_at = now
-
     await change_balance(
-        session=session,
-        chat_id=chat_id,
-        user_id=user_id,
-        amount=amount,
-        transaction_type="daily_bonus",
-        description="Ежедневный бонус",
+        session,
+        chat_id,
+        user_id,
+        amount,
+        "daily_bonus",
+        "Ежедневный бонус",
     )
+
+    member.last_bonus_at = utcnow()
 
     return ServiceResult(
         True,
         (
-            "🎁 <b>Ежедневный бонус!</b>\n\n"
-            f"Ты получил <b>+{format_balance(amount)}</b> 🥜"
+            "🎁 <b>Ежедневный бонус</b>\n\n"
+            f"Ты получил <b>{format_balance(amount)}</b> 🥜."
         ),
         changed=True,
-    )
-
-
-# ============================================================================
-# LEADERBOARD
-# ============================================================================
-
-
-async def get_leaderboard(
-    session: AsyncSession,
-    chat_id: int,
-) -> str:
-
-    by_balance = await get_top_by_balance(
-        session,
-        chat_id,
-        10,
-    )
-
-    by_xp = await get_top_by_xp(
-        session,
-        chat_id,
-        10,
-    )
-
-    by_messages = await get_top_by_messages(
-        session,
-        chat_id,
-        10,
-    )
-
-    by_size = await get_top_by_penis_size(
-        session,
-        chat_id,
-        10,
-    )
-
-    user_ids = {
-        member.user_id
-        for member in (
-            by_balance
-            + by_xp
-            + by_messages
-            + by_size
-        )
-    }
-
-    users: dict[int, User] = {}
-
-    if user_ids:
-        result = await session.execute(
-            select(User).where(
-                User.id.in_(user_ids)
-            )
-        )
-
-        users = {
-            user.id: user
-            for user in result.scalars().all()
-        }
-
-    def line(
-        index: int,
-        member: ChatMember,
-        value: str,
-    ) -> str:
-
-        user = users.get(
-            member.user_id
-        )
-
-        name = (
-            escape(member.profile_nick)
-            if member.profile_nick
-            else clean_name(user)
-        )
-
-        return (
-            f"<b>{index}.</b> "
-            f"{name} — {value}"
-        )
-
-    balance_lines = [
-        line(
-            i,
-            member,
-            f"{format_balance(member.balance)} 🥜",
-        )
-        for i, member in enumerate(
-            by_balance,
-            start=1,
-        )
-    ]
-
-    xp_lines = [
-        line(
-            i,
-            member,
-            f"{format_balance(member.xp)} XP",
-        )
-        for i, member in enumerate(
-            by_xp,
-            start=1,
-        )
-    ]
-
-    message_lines = [
-        line(
-            i,
-            member,
-            f"{format_balance(member.messages)} 💬",
-        )
-        for i, member in enumerate(
-            by_messages,
-            start=1,
-        )
-    ]
-
-    size_lines = [
-        line(
-            i,
-            member,
-            f"{member.penis_size:.2f} см 📏",
-        )
-        for i, member in enumerate(
-            by_size,
-            start=1,
-        )
-    ]
-
-    return (
-        "🏆 <b>ТОП ИГРОКОВ</b>\n\n"
-        "🥜 <b>По арахису</b>\n"
-        + (
-            "\n".join(balance_lines)
-            if balance_lines
-            else "Пока пусто."
-        )
-        + "\n\n⭐ <b>По XP</b>\n"
-        + (
-            "\n".join(xp_lines)
-            if xp_lines
-            else "Пока пусто."
-        )
-        + "\n\n💬 <b>По сообщениям</b>\n"
-        + (
-            "\n".join(message_lines)
-            if message_lines
-            else "Пока пусто."
-        )
-        + "\n\n📏 <b>По размеру</b>\n"
-        + (
-            "\n".join(size_lines)
-            if size_lines
-            else "Пока пусто."
-        )
     )
 
 
@@ -1117,7 +1393,6 @@ async def transfer_money(
     receiver_id: int,
     amount: int,
 ) -> ServiceResult:
-
     if amount <= 0:
         return ServiceResult(
             False,
@@ -1127,7 +1402,7 @@ async def transfer_money(
     if sender_id == receiver_id:
         return ServiceResult(
             False,
-            "❌ Нельзя перевести арахис самому себе.",
+            "😐 Самому себе переводить арахис нельзя.",
         )
 
     sender, error = await can_afford(
@@ -1143,43 +1418,12 @@ async def transfer_money(
             error,
         )
 
-    receiver = await get_member(
-        session,
-        chat_id,
-        receiver_id,
-    )
-
-    if receiver is None:
-        receiver = await ensure_member(
-            session,
-            chat_id,
-            receiver_id,
-        )
-
-    sender_user = await session.get(
-        User,
-        sender_id,
-    )
-
-    receiver_user = await session.get(
-        User,
-        receiver_id,
-    )
-
-    sender_name = clean_name(
-        sender_user
-    )
-
-    receiver_name = clean_name(
-        receiver_user
-    )
-
     await change_balance(
         session,
         chat_id,
         sender_id,
         -amount,
-        "transfer_sent",
+        "transfer_out",
         f"Перевод пользователю {receiver_id}",
     )
 
@@ -1188,19 +1432,19 @@ async def transfer_money(
         chat_id,
         receiver_id,
         amount,
-        "transfer_received",
+        "transfer_in",
         f"Перевод от пользователя {sender_id}",
     )
 
     return ServiceResult(
         True,
         (
-            "💸 <b>Перевод выполнен!</b>\n\n"
-            f"{sender_name} → {receiver_name}\n"
-            f"Сумма: <b>{format_balance(amount)}</b> 🥜"
+            f"💸 Перевод выполнен.\n"
+            f"Отправлено: <b>{format_balance(amount)}</b> 🥜"
         ),
         changed=True,
     )
+
 
 # ============================================================================
 # GAMES COMMON
@@ -1211,28 +1455,14 @@ def game_unlocked(
     member: ChatMember,
     game_type: str,
 ) -> bool:
+    required_level = get_feature_required_level(
+        game_type
+    )
 
-    required_level = 1
-
-    for level, features in LEVEL_UNLOCKS.items():
-        if game_type in features:
-            required_level = min(
-                required_level,
-                level,
-            )
-
-    # Более надёжный поиск по таблице unlocks.
-    found_level = None
-
-    for level, features in LEVEL_UNLOCKS.items():
-        if game_type in features:
-            found_level = level
-            break
-
-    if found_level is None:
+    if required_level is None:
         return True
 
-    return member.level >= found_level
+    return member.level >= required_level
 
 
 async def prepare_game(
@@ -1245,7 +1475,6 @@ async def prepare_game(
     Optional[ChatMember],
     Optional[ServiceResult],
 ]:
-
     error = valid_bet(bet)
 
     if error:
@@ -1267,29 +1496,25 @@ async def prepare_game(
             balance_error,
         )
 
-    if member is not None:
-        required_level = None
+    if member and not game_unlocked(
+        member,
+        game_type,
+    ):
+        required_level = get_feature_required_level(
+            game_type
+        )
 
-        for level, features in LEVEL_UNLOCKS.items():
-            if game_type in features:
-                required_level = level
-                break
-
-        if (
-            required_level is not None
-            and member.level < required_level
-        ):
-            return (
-                member,
-                ServiceResult(
-                    False,
-                    (
-                        f"🔒 Игра откроется на "
-                        f"<b>{required_level} уровне</b>.\n"
-                        f"Твой уровень: <b>{member.level}</b>."
-                    ),
+        return (
+            member,
+            ServiceResult(
+                False,
+                (
+                    f"🔒 Игра открывается на "
+                    f"<b>{required_level} уровне</b>.\n"
+                    f"Твой уровень: <b>{member.level}</b>."
                 ),
-            )
+            ),
+        )
 
     return member, None
 
@@ -1304,11 +1529,8 @@ async def finish_game(
     multiplier: float,
     won: bool,
 ) -> int:
-
     payout = (
-        int(
-            bet * multiplier
-        )
+        int(bet * multiplier)
         if won
         else 0
     )
@@ -1371,7 +1593,7 @@ async def finish_game(
 
 
 # ============================================================================
-# COINFLIP
+# SINGLE PLAYER GAMES
 # ============================================================================
 
 
@@ -1381,7 +1603,6 @@ async def play_coinflip(
     user_id: int,
     bet: int,
 ) -> ServiceResult:
-
     _, error = await prepare_game(
         session,
         chat_id,
@@ -1399,8 +1620,6 @@ async def play_coinflip(
 
     won = result == "Орёл"
 
-    multiplier = 1.95 if won else 0
-
     payout = await finish_game(
         session,
         chat_id,
@@ -1408,33 +1627,22 @@ async def play_coinflip(
         "coinflip",
         bet,
         result,
-        multiplier,
+        1.95 if won else 0,
         won,
     )
 
-    if won:
-        text = (
-            "🪙 <b>Орёл!</b>\n\n"
-            f"🎉 Ты выиграл "
-            f"<b>{format_balance(payout - bet)}</b> 🥜"
-        )
-    else:
-        text = (
-            "🪙 <b>Решка!</b>\n\n"
-            f"💀 Ты проиграл "
-            f"<b>{format_balance(bet)}</b> 🥜"
-        )
-
     return ServiceResult(
         True,
-        text,
+        (
+            f"🪙 Выпало: <b>{result}</b>\n\n"
+            + (
+                f"🎉 Выплата: <b>{format_balance(payout)}</b> 🥜"
+                if won
+                else "💀 Ставка проиграна."
+            )
+        ),
         changed=True,
     )
-
-
-# ============================================================================
-# DICE
-# ============================================================================
 
 
 async def play_dice(
@@ -1443,7 +1651,6 @@ async def play_dice(
     user_id: int,
     bet: int,
 ) -> ServiceResult:
-
     _, error = await prepare_game(
         session,
         chat_id,
@@ -1457,12 +1664,9 @@ async def play_dice(
 
     first = RNG.randint(1, 6)
     second = RNG.randint(1, 6)
-
     total = first + second
 
     won = total >= 8
-
-    multiplier = 1.8 if won else 0
 
     payout = await finish_game(
         session,
@@ -1471,35 +1675,22 @@ async def play_dice(
         "dice",
         bet,
         str(total),
-        multiplier,
+        1.8 if won else 0,
         won,
     )
 
-    if won:
-        text = (
-            f"🎲 {first} + {second} = "
-            f"<b>{total}</b>\n\n"
-            f"🏆 Выигрыш: "
-            f"<b>{format_balance(payout - bet)}</b> 🥜"
-        )
-    else:
-        text = (
-            f"🎲 {first} + {second} = "
-            f"<b>{total}</b>\n\n"
-            f"💀 Проигрыш: "
-            f"<b>{format_balance(bet)}</b> 🥜"
-        )
-
     return ServiceResult(
         True,
-        text,
+        (
+            f"🎲 {first} + {second} = <b>{total}</b>\n\n"
+            + (
+                f"🏆 Выплата: <b>{format_balance(payout)}</b> 🥜"
+                if won
+                else "💀 Проигрыш."
+            )
+        ),
         changed=True,
     )
-
-
-# ============================================================================
-# SLOTS
-# ============================================================================
 
 
 async def play_slots(
@@ -1508,7 +1699,6 @@ async def play_slots(
     user_id: int,
     bet: int,
 ) -> ServiceResult:
-
     _, error = await prepare_game(
         session,
         chat_id,
@@ -1540,13 +1730,13 @@ async def play_slots(
         == result[1]
         == result[2]
     ):
-        if result[0] == "7️⃣":
-            multiplier = 10.0
-        elif result[0] == "💎":
-            multiplier = 7.0
-        else:
-            multiplier = 5.0
-
+        multiplier = {
+            "7️⃣": 10.0,
+            "💎": 7.0,
+        }.get(
+            result[0],
+            5.0,
+        )
         won = True
 
     elif (
@@ -1578,24 +1768,17 @@ async def play_slots(
         + " |</b>\n\n"
     )
 
-    if won:
-        text += (
-            f"🎉 Выплата: "
-            f"<b>{format_balance(payout)}</b> 🥜"
-        )
-    else:
-        text += "💀 Не повезло."
+    text += (
+        f"🎉 Выплата: <b>{format_balance(payout)}</b> 🥜"
+        if won
+        else "💀 Не повезло."
+    )
 
     return ServiceResult(
         True,
         text,
         changed=True,
     )
-
-
-# ============================================================================
-# ROULETTE
-# ============================================================================
 
 
 async def play_roulette(
@@ -1605,7 +1788,6 @@ async def play_roulette(
     bet: int,
     choice: str,
 ) -> ServiceResult:
-
     _, error = await prepare_game(
         session,
         chat_id,
@@ -1636,7 +1818,6 @@ async def play_roulette(
 
     if number == 0:
         color = "green"
-
     elif number in {
         1, 3, 5, 7, 9,
         12, 14, 16, 18,
@@ -1645,7 +1826,6 @@ async def play_roulette(
         36,
     }:
         color = "red"
-
     else:
         color = "black"
 
@@ -1672,36 +1852,24 @@ async def play_roulette(
         won,
     )
 
-    color_emoji = {
+    emoji = {
         "red": "🔴",
         "black": "⚫",
         "green": "🟢",
     }[color]
 
-    if won:
-        text = (
-            f"🎡 Выпало: "
-            f"<b>{number}</b> {color_emoji}\n\n"
-            f"🎉 Выплата: "
-            f"<b>{format_balance(payout)}</b> 🥜"
-        )
-    else:
-        text = (
-            f"🎡 Выпало: "
-            f"<b>{number}</b> {color_emoji}\n\n"
-            "💀 Проигрыш."
-        )
-
     return ServiceResult(
         True,
-        text,
+        (
+            f"🎡 Выпало: <b>{number}</b> {emoji}\n\n"
+            + (
+                f"🎉 Выплата: <b>{format_balance(payout)}</b> 🥜"
+                if won
+                else "💀 Проигрыш."
+            )
+        ),
         changed=True,
     )
-
-
-# ============================================================================
-# GUESS
-# ============================================================================
 
 
 async def play_guess(
@@ -1711,7 +1879,6 @@ async def play_guess(
     bet: int,
     number: int,
 ) -> ServiceResult:
-
     if number < 1 or number > 10:
         return ServiceResult(
             False,
@@ -1736,8 +1903,6 @@ async def play_guess(
 
     won = generated == number
 
-    multiplier = 9.0 if won else 0
-
     payout = await finish_game(
         session,
         chat_id,
@@ -1745,34 +1910,22 @@ async def play_guess(
         "guess",
         bet,
         f"{number}:{generated}",
-        multiplier,
+        9.0 if won else 0,
         won,
     )
 
-    if won:
-        text = (
-            f"🔢 Выпало число "
-            f"<b>{generated}</b>!\n\n"
-            f"🎉 Ты выиграл "
-            f"<b>{format_balance(payout - bet)}</b> 🥜"
-        )
-    else:
-        text = (
-            f"🔢 Выпало число "
-            f"<b>{generated}</b>.\n\n"
-            "💀 Не угадал."
-        )
-
     return ServiceResult(
         True,
-        text,
+        (
+            f"🔢 Выпало: <b>{generated}</b>\n\n"
+            + (
+                f"🎉 Выплата: <b>{format_balance(payout)}</b> 🥜"
+                if won
+                else "💀 Не угадал."
+            )
+        ),
         changed=True,
     )
-
-
-# ============================================================================
-# FOOTBALL
-# ============================================================================
 
 
 async def play_football(
@@ -1781,7 +1934,6 @@ async def play_football(
     user_id: int,
     bet: int,
 ) -> ServiceResult:
-
     _, error = await prepare_game(
         session,
         chat_id,
@@ -1807,8 +1959,6 @@ async def play_football(
         "⚽ Красивый гол!",
     }
 
-    multiplier = 2.0 if won else 0
-
     payout = await finish_game(
         session,
         chat_id,
@@ -1816,32 +1966,22 @@ async def play_football(
         "football",
         bet,
         result,
-        multiplier,
+        2.0 if won else 0,
         won,
     )
 
-    if won:
-        text = (
-            f"⚽ <b>{result}</b>\n\n"
-            f"🏆 Выплата: "
-            f"<b>{format_balance(payout)}</b> 🥜"
-        )
-    else:
-        text = (
-            f"⚽ <b>{result}</b>\n\n"
-            "💀 Ставка проиграна."
-        )
-
     return ServiceResult(
         True,
-        text,
+        (
+            f"⚽ <b>{result}</b>\n\n"
+            + (
+                f"🏆 Выплата: <b>{format_balance(payout)}</b> 🥜"
+                if won
+                else "💀 Ставка проиграна."
+            )
+        ),
         changed=True,
     )
-
-
-# ============================================================================
-# BASKETBALL
-# ============================================================================
 
 
 async def play_basketball(
@@ -1850,7 +1990,6 @@ async def play_basketball(
     user_id: int,
     bet: int,
 ) -> ServiceResult:
-
     _, error = await prepare_game(
         session,
         chat_id,
@@ -1871,13 +2010,7 @@ async def play_basketball(
         ]
     )
 
-    won = result in {
-        "🏀 Попадание!",
-        "🏀 Трёшка!",
-        "🏀 Данкан!",
-    }
-
-    multiplier = 2.0 if won else 0
+    won = result != "🧱 Мимо!"
 
     payout = await finish_game(
         session,
@@ -1886,32 +2019,22 @@ async def play_basketball(
         "basketball",
         bet,
         result,
-        multiplier,
+        2.0 if won else 0,
         won,
     )
 
-    if won:
-        text = (
-            f"🏀 <b>{result}</b>\n\n"
-            f"🏆 Выплата: "
-            f"<b>{format_balance(payout)}</b> 🥜"
-        )
-    else:
-        text = (
-            f"🏀 <b>{result}</b>\n\n"
-            "💀 Мимо."
-        )
-
     return ServiceResult(
         True,
-        text,
+        (
+            f"🏀 <b>{result}</b>\n\n"
+            + (
+                f"🏆 Выплата: <b>{format_balance(payout)}</b> 🥜"
+                if won
+                else "💀 Мимо."
+            )
+        ),
         changed=True,
     )
-
-
-# ============================================================================
-# CREATE GAME / LIST
-# ============================================================================
 
 
 async def create_game(
@@ -1921,7 +2044,6 @@ async def create_game(
     game_type: str,
     bet: int,
 ) -> ServiceResult:
-
     handlers = {
         "coinflip": play_coinflip,
         "dice": play_dice,
@@ -1971,7 +2093,6 @@ def get_game_list() -> list[str]:
 def ttt_keyboard(
     game: TicTacToeGame,
 ) -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     for position, symbol in enumerate(
@@ -1986,9 +2107,7 @@ def ttt_keyboard(
 
         builder.button(
             text=text,
-            callback_data=(
-                f"ttt:{game.id}:{position}"
-            ),
+            callback_data=f"ttt:{game.id}:{position}",
         )
 
     builder.adjust(3)
@@ -1999,7 +2118,6 @@ def ttt_keyboard(
 def ttt_winner(
     board: str,
 ) -> Optional[str]:
-
     wins = [
         (0, 1, 2),
         (3, 4, 5),
@@ -2032,7 +2150,6 @@ async def start_tictactoe(
     user_id: int,
     bet: int = 10,
 ) -> ServiceResult:
-
     if bet < 10:
         return ServiceResult(
             False,
@@ -2052,7 +2169,9 @@ async def start_tictactoe(
             user_id,
         )
 
-    required_level = 10
+    required_level = get_feature_required_level(
+        "tictactoe"
+    ) or 10
 
     if member.level < required_level:
         return ServiceResult(
@@ -2095,7 +2214,6 @@ async def start_tictactoe(
                 "❌ У тебя уже есть активная игра.",
             )
 
-    # Ставка резервируется сразу.
     await change_balance(
         session,
         chat_id,
@@ -2115,7 +2233,6 @@ async def start_tictactoe(
     )
 
     session.add(game)
-
     await session.flush()
 
     keyboard = InlineKeyboardMarkup(
@@ -2123,9 +2240,7 @@ async def start_tictactoe(
             [
                 InlineKeyboardButton(
                     text="🎮 Присоединиться",
-                    callback_data=(
-                        f"tttjoin:{game.id}"
-                    ),
+                    callback_data=f"tttjoin:{game.id}",
                 )
             ]
         ]
@@ -2149,7 +2264,6 @@ async def join_tictactoe(
     game_id: int,
     user_id: int,
 ) -> ServiceResult:
-
     game = await session.get(
         TicTacToeGame,
         game_id,
@@ -2179,7 +2293,7 @@ async def join_tictactoe(
             show_alert=True,
         )
 
-    member, error = await can_afford(
+    _, error = await can_afford(
         session,
         game.chat_id,
         user_id,
@@ -2225,7 +2339,6 @@ async def tictactoe_move(
     user_id: int,
     position: int,
 ) -> ServiceResult:
-
     game = await session.get(
         TicTacToeGame,
         game_id,
@@ -2247,6 +2360,17 @@ async def tictactoe_move(
             show_alert=True,
         )
 
+    if user_id not in {
+        game.player_x_id,
+        game.player_o_id,
+    }:
+        return ServiceResult(
+            False,
+            "❌ Ты не участник этой игры.",
+            answer="Ты не участник.",
+            show_alert=True,
+        )
+
     if user_id != game.current_player_id:
         return ServiceResult(
             False,
@@ -2263,9 +2387,7 @@ async def tictactoe_move(
             show_alert=True,
         )
 
-    board = list(
-        game.board
-    )
+    board = list(game.board)
 
     if board[position] != "-":
         return ServiceResult(
@@ -2289,15 +2411,11 @@ async def tictactoe_move(
     )
 
     if winner:
-
         game.status = "finished"
 
         if winner == "draw":
             game.winner_id = None
 
-            total = game.bet * 2
-
-            # При ничьей возвращаем обе ставки.
             await change_balance(
                 session,
                 game.chat_id,
@@ -2373,11 +2491,12 @@ async def tictactoe_move(
                 "⭕❌ <b>Игра окончена!</b>\n\n"
                 f"Победитель: "
                 f"<a href=\"tg://user?id={winner_id}\">"
-                f"игрок"
-                f"</a> 🎉\n"
+                f"игрок</a> 🎉\n"
                 f"🏆 Выигрыш: "
                 f"<b>{format_balance(game.bet * 2)}</b> 🥜"
             )
+
+        await session.flush()
 
         return ServiceResult(
             True,
@@ -2402,8 +2521,7 @@ async def tictactoe_move(
 
     current_symbol = (
         "❌"
-        if game.current_player_id
-        == game.player_x_id
+        if game.current_player_id == game.player_x_id
         else "⭕"
     )
 
@@ -2417,843 +2535,477 @@ async def tictactoe_move(
         keyboard=ttt_keyboard(game),
     )
 
+
 # ============================================================================
-# GAMES COMMON
+# NORMAL RP
 # ============================================================================
 
 
-def game_unlocked(
-    member: ChatMember,
-    game_type: str,
-) -> bool:
-
-    required_level = 1
-
-    for level, features in LEVEL_UNLOCKS.items():
-        if game_type in features:
-            required_level = min(
-                required_level,
-                level,
-            )
-
-    # Более надёжный поиск по таблице unlocks.
-    found_level = None
-
-    for level, features in LEVEL_UNLOCKS.items():
-        if game_type in features:
-            found_level = level
-            break
-
-    if found_level is None:
-        return True
-
-    return member.level >= found_level
-
-
-async def prepare_game(
+async def perform_rp(
     session: AsyncSession,
     chat_id: int,
-    user_id: int,
-    game_type: str,
-    bet: int,
-) -> tuple[
-    Optional[ChatMember],
-    Optional[ServiceResult],
-]:
+    actor_id: int,
+    action: str,
+    target_id: Optional[int] = None,
+    target_name: Optional[str] = None,
+) -> ServiceResult:
+    normalized = normalize_text(
+        action.replace("_", " ")
+    )
 
-    error = valid_bet(bet)
+    # ------------------------------------------------------------
+    # 18+ actions
+    # ------------------------------------------------------------
+
+    adult_action = get_adult_rp_action(
+        normalized
+    )
+
+    if adult_action is not None:
+        return await perform_adult_rp(
+            session=session,
+            chat_id=chat_id,
+            actor_id=actor_id,
+            action=normalized,
+            target_id=target_id,
+            target_name=target_name,
+        )
+
+    # ------------------------------------------------------------
+    # Normal RP
+    # ------------------------------------------------------------
+
+    matched = None
+
+    for key, data in RP_ACTIONS.items():
+        aliases = data.get(
+            "aliases",
+            (),
+        )
+
+        for alias in aliases:
+            if normalize_text(
+                str(alias)
+            ) == normalized:
+                matched = (
+                    key,
+                    data,
+                )
+                break
+
+        if matched:
+            break
+
+    if matched is None:
+        return ServiceResult(
+            False,
+            "❌ Неизвестная RP-команда.",
+        )
+
+    key, data = matched
+
+    if target_id is None:
+        return ServiceResult(
+            False,
+            "❌ Укажи пользователя через reply или @username.",
+        )
+
+    if actor_id == target_id:
+        return ServiceResult(
+            False,
+            "😐 На себя RP-команды использовать нельзя.",
+        )
+
+    target_user = await session.get(
+        User,
+        target_id,
+    )
+
+    if target_user is None:
+        return ServiceResult(
+            False,
+            "❌ Пользователь не найден.",
+        )
+
+    _, error = await can_afford(
+        session,
+        chat_id,
+        actor_id,
+        NORMAL_RP_COST,
+    )
 
     if error:
-        return None, ServiceResult(
+        return ServiceResult(
             False,
             error,
         )
 
-    member, balance_error = await can_afford(
+    await change_balance(
         session,
         chat_id,
-        user_id,
-        bet,
+        actor_id,
+        -NORMAL_RP_COST,
+        "rp",
+        f"Обычный RP: {key}",
     )
 
-    if balance_error:
-        return member, ServiceResult(
-            False,
-            balance_error,
+    emoji = str(
+        data.get(
+            "emoji",
+            "🎭",
+        )
+    )
+
+    verb = str(
+        data.get(
+            "verb",
+            key,
+        )
+    )
+
+    actor = await session.get(
+        User,
+        actor_id,
+    )
+
+    actor_name = clean_name(actor)
+
+    if target_name is None:
+        target_name = clean_name(
+            target_user
         )
 
-    if member is not None:
-        required_level = None
-
-        for level, features in LEVEL_UNLOCKS.items():
-            if game_type in features:
-                required_level = level
-                break
-
-        if (
-            required_level is not None
-            and member.level < required_level
-        ):
-            return (
-                member,
-                ServiceResult(
-                    False,
-                    (
-                        f"🔒 Игра откроется на "
-                        f"<b>{required_level} уровне</b>.\n"
-                        f"Твой уровень: <b>{member.level}</b>."
-                    ),
-                ),
-            )
-
-    return member, None
+    return ServiceResult(
+        True,
+        (
+            f"{emoji} "
+            f"{user_mention(actor_id, actor_name)} "
+            f"<b>{verb}</b> "
+            f"{target_name}\n\n"
+            f"💸 Стоимость: <b>{NORMAL_RP_COST}</b> 🥜"
+        ),
+        changed=True,
+    )
 
 
-async def finish_game(
+# ============================================================================
+# ADULT RP
+# ============================================================================
+
+
+async def _consume_user_item(
+    session: AsyncSession,
+    item: UserItem,
+) -> None:
+    if item.quantity > 1:
+        item.quantity -= 1
+    else:
+        await session.delete(item)
+
+
+async def _has_item(
     session: AsyncSession,
     chat_id: int,
     user_id: int,
-    game_type: str,
-    bet: int,
-    result: str,
-    multiplier: float,
-    won: bool,
-) -> int:
-
-    payout = (
-        int(
-            bet * multiplier
-        )
-        if won
-        else 0
+    item_code: str,
+) -> Optional[UserItem]:
+    return await get_user_item(
+        session,
+        chat_id,
+        user_id,
+        item_code,
     )
+
+
+async def perform_adult_rp(
+    session: AsyncSession,
+    chat_id: int,
+    actor_id: int,
+    action: str,
+    target_id: Optional[int] = None,
+    target_name: Optional[str] = None,
+) -> ServiceResult:
+    adult_action = get_adult_rp_action(
+        normalize_text(action)
+    )
+
+    if adult_action is None:
+        return ServiceResult(
+            False,
+            "❌ Неизвестная 18+ RP-команда.",
+        )
+
+    if target_id is None:
+        return ServiceResult(
+            False,
+            "❌ Укажи пользователя через reply или @username.",
+        )
+
+    if actor_id == target_id:
+        return ServiceResult(
+            False,
+            "😐 На себя это действие использовать нельзя.",
+        )
+
+    actor_member = await get_member(
+        session,
+        chat_id,
+        actor_id,
+    )
+
+    target_member = await get_member(
+        session,
+        chat_id,
+        target_id,
+    )
+
+    if actor_member is None:
+        actor_member = await ensure_member(
+            session,
+            chat_id,
+            actor_id,
+        )
+
+    if target_member is None:
+        target_member = await ensure_member(
+            session,
+            chat_id,
+            target_id,
+        )
+
+    # Ребёнок блокирует 18+ RP.
+    if actor_member.has_child:
+        if (
+            actor_member.child_until is not None
+            and actor_member.child_until <= utcnow()
+        ):
+            actor_member.has_child = False
+            actor_member.child_until = None
+        else:
+            return ServiceResult(
+                False,
+                "👶 Пока активен эффект ребёнка, 18+ RP недоступен.",
+            )
+
+    # Основной cooldown.
+    cooldown = ADULT_RP_COOLDOWN
+
+    rubber = await _has_item(
+        session,
+        chat_id,
+        actor_id,
+        RUBBER_PUSSY_ITEM_CODE,
+    )
+
+    if rubber:
+        cooldown *= RUBBER_PUSSY_COOLDOWN_MULTIPLIER
+
+    remaining = cooldown_remaining(
+        actor_member.last_adult_rp_at,
+        cooldown,
+    )
+
+    if remaining:
+        return ServiceResult(
+            False,
+            (
+                "⏳ 18+ RP пока на cooldown.\n"
+                f"Осталось: <b>{format_seconds(remaining)}</b>."
+            ),
+        )
+
+    _, error = await can_afford(
+        session,
+        chat_id,
+        actor_id,
+        ADULT_RP_COST,
+    )
+
+    if error:
+        return ServiceResult(
+            False,
+            error,
+        )
 
     await change_balance(
         session,
         chat_id,
-        user_id,
-        -bet,
-        "game_bet",
-        f"Ставка: {game_type}",
+        actor_id,
+        -ADULT_RP_COST,
+        "adult_rp",
+        f"18+ RP: {adult_action.key}",
     )
 
-    if payout > 0:
-        await change_balance(
+    base_gain = RNG.uniform(
+        ADULT_RP_SIZE_GAIN_MIN,
+        ADULT_RP_SIZE_GAIN_MAX,
+    )
+
+    target_loss = RNG.uniform(
+        ADULT_RP_TARGET_SIZE_LOSS_MIN,
+        ADULT_RP_TARGET_SIZE_LOSS_MAX,
+    )
+
+    actor_gain = (
+        base_gain
+        * adult_action.actor_size_multiplier
+    )
+
+    target_loss *= (
+        adult_action.target_size_multiplier
+    )
+
+    lubricant = None
+
+    if adult_action.can_use_lubricant:
+        lubricant = await _has_item(
             session,
             chat_id,
-            user_id,
-            payout,
-            "game_payout",
-            f"Выигрыш: {game_type}",
+            actor_id,
+            LUBRICANT_ITEM_CODE,
         )
 
-    member = await get_member(
-        session,
-        chat_id,
-        user_id,
-    )
-
-    if member:
-        member.games_played += 1
-
-        if won:
-            member.games_won += 1
-            member.total_won += max(
-                0,
-                payout - bet,
+        if lubricant:
+            actor_gain *= (
+                1.0 + LUBRICANT_GROWTH_BONUS
             )
-        else:
-            member.games_lost += 1
-            member.total_lost += bet
 
-    session.add(
-        Game(
-            chat_id=chat_id,
-            user_id=user_id,
-            game_type=game_type,
-            bet=bet,
-            result=result,
-            multiplier=multiplier,
-            payout=payout,
-            won=won,
-            status="finished",
-        )
+            await _consume_user_item(
+                session,
+                lubricant,
+            )
+
+    actor_member.penis_size = round(
+        max(
+            0.0,
+            actor_member.penis_size
+            + actor_gain,
+        ),
+        2,
     )
 
-    await session.flush()
+    target_member.penis_size = round(
+        max(
+            0.0,
+            target_member.penis_size
+            - target_loss,
+        ),
+        2,
+    )
 
-    return payout
+    actor_member.last_adult_rp_at = utcnow()
 
-
-# ============================================================================
-# COINFLIP
-# ============================================================================
-
-
-async def play_coinflip(
-    session: AsyncSession,
-    chat_id: int,
-    user_id: int,
-    bet: int,
-) -> ServiceResult:
-
-    _, error = await prepare_game(
+    # Болезнь может передаваться.
+    condom = await _has_item(
         session,
         chat_id,
-        user_id,
-        "coinflip",
-        bet,
+        actor_id,
+        CONDOM_ITEM_CODE,
     )
 
-    if error:
-        return error
-
-    result = RNG.choice(
-        ["Орёл", "Решка"]
-    )
-
-    won = result == "Орёл"
-
-    multiplier = 1.95 if won else 0
-
-    payout = await finish_game(
-        session,
-        chat_id,
-        user_id,
-        "coinflip",
-        bet,
-        result,
-        multiplier,
-        won,
-    )
-
-    if won:
-        text = (
-            "🪙 <b>Орёл!</b>\n\n"
-            f"🎉 Ты выиграл "
-            f"<b>{format_balance(payout - bet)}</b> 🥜"
-        )
-    else:
-        text = (
-            "🪙 <b>Решка!</b>\n\n"
-            f"💀 Ты проиграл "
-            f"<b>{format_balance(bet)}</b> 🥜"
+    if condom:
+        await _consume_user_item(
+            session,
+            condom,
         )
 
-    return ServiceResult(
-        True,
-        text,
-        changed=True,
-    )
+    disease_chance = DISEASE_CONTRACT_CHANCE
 
-
-# ============================================================================
-# DICE
-# ============================================================================
-
-
-async def play_dice(
-    session: AsyncSession,
-    chat_id: int,
-    user_id: int,
-    bet: int,
-) -> ServiceResult:
-
-    _, error = await prepare_game(
-        session,
-        chat_id,
-        user_id,
-        "dice",
-        bet,
-    )
-
-    if error:
-        return error
-
-    first = RNG.randint(1, 6)
-    second = RNG.randint(1, 6)
-
-    total = first + second
-
-    won = total >= 8
-
-    multiplier = 1.8 if won else 0
-
-    payout = await finish_game(
-        session,
-        chat_id,
-        user_id,
-        "dice",
-        bet,
-        str(total),
-        multiplier,
-        won,
-    )
-
-    if won:
-        text = (
-            f"🎲 {first} + {second} = "
-            f"<b>{total}</b>\n\n"
-            f"🏆 Выигрыш: "
-            f"<b>{format_balance(payout - bet)}</b> 🥜"
+    if condom:
+        disease_chance *= (
+            1.0 - CONDOM_DISEASE_PROTECTION_CHANCE
         )
-    else:
-        text = (
-            f"🎲 {first} + {second} = "
-            f"<b>{total}</b>\n\n"
-            f"💀 Проигрыш: "
-            f"<b>{format_balance(bet)}</b> 🥜"
-        )
-
-    return ServiceResult(
-        True,
-        text,
-        changed=True,
-    )
-
-
-# ============================================================================
-# SLOTS
-# ============================================================================
-
-
-async def play_slots(
-    session: AsyncSession,
-    chat_id: int,
-    user_id: int,
-    bet: int,
-) -> ServiceResult:
-
-    _, error = await prepare_game(
-        session,
-        chat_id,
-        user_id,
-        "slots",
-        bet,
-    )
-
-    if error:
-        return error
-
-    symbols = [
-        "🍒",
-        "🍋",
-        "🍊",
-        "🔔",
-        "⭐",
-        "💎",
-        "7️⃣",
-    ]
-
-    result = [
-        RNG.choice(symbols)
-        for _ in range(3)
-    ]
 
     if (
-        result[0]
-        == result[1]
-        == result[2]
+        target_member.has_disease
+        and RNG.random() < disease_chance
     ):
-        if result[0] == "7️⃣":
-            multiplier = 10.0
-        elif result[0] == "💎":
-            multiplier = 7.0
-        else:
-            multiplier = 5.0
-
-        won = True
-
-    elif (
-        result[0] == result[1]
-        or result[1] == result[2]
-        or result[0] == result[2]
-    ):
-        multiplier = 2.0
-        won = True
-
-    else:
-        multiplier = 0
-        won = False
-
-    payout = await finish_game(
-        session,
-        chat_id,
-        user_id,
-        "slots",
-        bet,
-        "".join(result),
-        multiplier,
-        won,
-    )
-
-    text = (
-        "🎰 <b>| "
-        + " | ".join(result)
-        + " |</b>\n\n"
-    )
-
-    if won:
-        text += (
-            f"🎉 Выплата: "
-            f"<b>{format_balance(payout)}</b> 🥜"
+        actor_member.has_disease = True
+        actor_member.disease_since = utcnow()
+        actor_member.next_disease_tick = (
+            utcnow()
+            + timedelta(
+                hours=1
+            )
         )
-    else:
-        text += "💀 Не повезло."
+
+    # Ребёнок.
+    impregnation_chance = (
+        IMPREGNATION_CHANCE_WITH_CONDOM
+        if condom
+        else IMPREGNATION_CHANCE_WITHOUT_CONDOM
+    )
+
+    child_triggered = (
+        RNG.random()
+        < impregnation_chance
+    )
+
+    if child_triggered:
+        actor_member.has_child = True
+        actor_member.child_until = (
+            utcnow()
+            + timedelta(
+                hours=CHILD_DURATION_HOURS
+            )
+        )
+        actor_member.last_child_support = None
+
+    actor = await session.get(
+        User,
+        actor_id,
+    )
+
+    target = await session.get(
+        User,
+        target_id,
+    )
+
+    if target_name is None:
+        target_name = clean_name(target)
+
+    actor_name = clean_name(actor)
+
+    extra = ""
+
+    if child_triggered:
+        extra += (
+            "\n👶 Сработал игровой эффект ребёнка."
+        )
+
+    if actor_member.has_disease:
+        extra += (
+            "\n🦠 У тебя есть риск болезни."
+        )
 
     return ServiceResult(
         True,
-        text,
+        (
+            f"{adult_action.emoji} "
+            f"{user_mention(actor_id, actor_name)} "
+            f"<b>{escape(adult_action.key)}</b> "
+            f"{target_name}\n\n"
+            f"📏 Твой размер: "
+            f"<b>{actor_member.penis_size:.2f} см</b>\n"
+            f"📉 Размер цели: "
+            f"<b>{target_member.penis_size:.2f} см</b>\n"
+            f"💸 Стоимость: <b>{ADULT_RP_COST}</b> 🥜"
+            f"{extra}"
+        ),
         changed=True,
     )
 
 
 # ============================================================================
-# ROULETTE
+# MASTURBATION
 # ============================================================================
 
 
-async def play_roulette(
+async def masturbate(
     session: AsyncSession,
     chat_id: int,
     user_id: int,
-    bet: int,
-    choice: str,
 ) -> ServiceResult:
-
-    _, error = await prepare_game(
-        session,
-        chat_id,
-        user_id,
-        "roulette",
-        bet,
-    )
-
-    if error:
-        return error
-
-    choice = choice.lower()
-
-    if choice not in {
-        "red",
-        "black",
-        "green",
-    }:
-        return ServiceResult(
-            False,
-            "❌ Выбор: red, black или green.",
-        )
-
-    number = RNG.randint(
-        0,
-        36,
-    )
-
-    if number == 0:
-        color = "green"
-
-    elif number in {
-        1, 3, 5, 7, 9,
-        12, 14, 16, 18,
-        19, 21, 23, 25,
-        27, 30, 32, 34,
-        36,
-    }:
-        color = "red"
-
-    else:
-        color = "black"
-
-    won = color == choice
-
-    multiplier = (
-        {
-            "red": 1.95,
-            "black": 1.95,
-            "green": 14.0,
-        }[choice]
-        if won
-        else 0
-    )
-
-    payout = await finish_game(
-        session,
-        chat_id,
-        user_id,
-        "roulette",
-        bet,
-        f"{number}:{color}",
-        multiplier,
-        won,
-    )
-
-    color_emoji = {
-        "red": "🔴",
-        "black": "⚫",
-        "green": "🟢",
-    }[color]
-
-    if won:
-        text = (
-            f"🎡 Выпало: "
-            f"<b>{number}</b> {color_emoji}\n\n"
-            f"🎉 Выплата: "
-            f"<b>{format_balance(payout)}</b> 🥜"
-        )
-    else:
-        text = (
-            f"🎡 Выпало: "
-            f"<b>{number}</b> {color_emoji}\n\n"
-            "💀 Проигрыш."
-        )
-
-    return ServiceResult(
-        True,
-        text,
-        changed=True,
-    )
-
-
-# ============================================================================
-# GUESS
-# ============================================================================
-
-
-async def play_guess(
-    session: AsyncSession,
-    chat_id: int,
-    user_id: int,
-    bet: int,
-    number: int,
-) -> ServiceResult:
-
-    if number < 1 or number > 10:
-        return ServiceResult(
-            False,
-            "❌ Число должно быть от 1 до 10.",
-        )
-
-    _, error = await prepare_game(
-        session,
-        chat_id,
-        user_id,
-        "guess",
-        bet,
-    )
-
-    if error:
-        return error
-
-    generated = RNG.randint(
-        1,
-        10,
-    )
-
-    won = generated == number
-
-    multiplier = 9.0 if won else 0
-
-    payout = await finish_game(
-        session,
-        chat_id,
-        user_id,
-        "guess",
-        bet,
-        f"{number}:{generated}",
-        multiplier,
-        won,
-    )
-
-    if won:
-        text = (
-            f"🔢 Выпало число "
-            f"<b>{generated}</b>!\n\n"
-            f"🎉 Ты выиграл "
-            f"<b>{format_balance(payout - bet)}</b> 🥜"
-        )
-    else:
-        text = (
-            f"🔢 Выпало число "
-            f"<b>{generated}</b>.\n\n"
-            "💀 Не угадал."
-        )
-
-    return ServiceResult(
-        True,
-        text,
-        changed=True,
-    )
-
-
-# ============================================================================
-# FOOTBALL
-# ============================================================================
-
-
-async def play_football(
-    session: AsyncSession,
-    chat_id: int,
-    user_id: int,
-    bet: int,
-) -> ServiceResult:
-
-    _, error = await prepare_game(
-        session,
-        chat_id,
-        user_id,
-        "football",
-        bet,
-    )
-
-    if error:
-        return error
-
-    result = RNG.choice(
-        [
-            "⚽ Гол!",
-            "🧤 Вратарь отбил!",
-            "🥅 Штанга!",
-            "⚽ Красивый гол!",
-        ]
-    )
-
-    won = result in {
-        "⚽ Гол!",
-        "⚽ Красивый гол!",
-    }
-
-    multiplier = 2.0 if won else 0
-
-    payout = await finish_game(
-        session,
-        chat_id,
-        user_id,
-        "football",
-        bet,
-        result,
-        multiplier,
-        won,
-    )
-
-    if won:
-        text = (
-            f"⚽ <b>{result}</b>\n\n"
-            f"🏆 Выплата: "
-            f"<b>{format_balance(payout)}</b> 🥜"
-        )
-    else:
-        text = (
-            f"⚽ <b>{result}</b>\n\n"
-            "💀 Ставка проиграна."
-        )
-
-    return ServiceResult(
-        True,
-        text,
-        changed=True,
-    )
-
-
-# ============================================================================
-# BASKETBALL
-# ============================================================================
-
-
-async def play_basketball(
-    session: AsyncSession,
-    chat_id: int,
-    user_id: int,
-    bet: int,
-) -> ServiceResult:
-
-    _, error = await prepare_game(
-        session,
-        chat_id,
-        user_id,
-        "basketball",
-        bet,
-    )
-
-    if error:
-        return error
-
-    result = RNG.choice(
-        [
-            "🏀 Попадание!",
-            "🏀 Трёшка!",
-            "🧱 Мимо!",
-            "🏀 Данкан!",
-        ]
-    )
-
-    won = result in {
-        "🏀 Попадание!",
-        "🏀 Трёшка!",
-        "🏀 Данкан!",
-    }
-
-    multiplier = 2.0 if won else 0
-
-    payout = await finish_game(
-        session,
-        chat_id,
-        user_id,
-        "basketball",
-        bet,
-        result,
-        multiplier,
-        won,
-    )
-
-    if won:
-        text = (
-            f"🏀 <b>{result}</b>\n\n"
-            f"🏆 Выплата: "
-            f"<b>{format_balance(payout)}</b> 🥜"
-        )
-    else:
-        text = (
-            f"🏀 <b>{result}</b>\n\n"
-            "💀 Мимо."
-        )
-
-    return ServiceResult(
-        True,
-        text,
-        changed=True,
-    )
-
-
-# ============================================================================
-# CREATE GAME / LIST
-# ============================================================================
-
-
-async def create_game(
-    session: AsyncSession,
-    chat_id: int,
-    user_id: int,
-    game_type: str,
-    bet: int,
-) -> ServiceResult:
-
-    handlers = {
-        "coinflip": play_coinflip,
-        "dice": play_dice,
-        "slots": play_slots,
-        "football": play_football,
-        "basketball": play_basketball,
-    }
-
-    handler = handlers.get(
-        game_type
-    )
-
-    if handler is None:
-        return ServiceResult(
-            False,
-            "❌ Эта игра запускается другим способом.",
-        )
-
-    return await handler(
-        session,
-        chat_id,
-        user_id,
-        bet,
-    )
-
-
-def get_game_list() -> list[str]:
-    return [
-        "coinflip",
-        "dice",
-        "slots",
-        "roulette",
-        "guess",
-        "football",
-        "basketball",
-        "tictactoe",
-        "blackjack",
-        "crash",
-    ]
-
-
-# ============================================================================
-# TIC TAC TOE
-# ============================================================================
-
-
-def ttt_keyboard(
-    game: TicTacToeGame,
-) -> InlineKeyboardMarkup:
-
-    builder = InlineKeyboardBuilder()
-
-    for position, symbol in enumerate(
-        game.board
-    ):
-        if symbol == "-":
-            text = "⬜"
-        elif symbol == "X":
-            text = "❌"
-        else:
-            text = "⭕"
-
-        builder.button(
-            text=text,
-            callback_data=(
-                f"ttt:{game.id}:{position}"
-            ),
-        )
-
-    builder.adjust(3)
-
-    return builder.as_markup()
-
-
-def ttt_winner(
-    board: str,
-) -> Optional[str]:
-
-    wins = [
-        (0, 1, 2),
-        (3, 4, 5),
-        (6, 7, 8),
-        (0, 3, 6),
-        (1, 4, 7),
-        (2, 5, 8),
-        (0, 4, 8),
-        (2, 4, 6),
-    ]
-
-    for a, b, c in wins:
-        if (
-            board[a] != "-"
-            and board[a]
-            == board[b]
-            == board[c]
-        ):
-            return board[a]
-
-    if "-" not in board:
-        return "draw"
-
-    return None
-
-
-async def start_tictactoe(
-    session: AsyncSession,
-    chat_id: int,
-    user_id: int,
-    bet: int = 10,
-) -> ServiceResult:
-
-    if bet < 10:
-        return ServiceResult(
-            False,
-            "❌ Минимальная ставка TTT — 10 🥜.",
-        )
-
     member = await get_member(
         session,
         chat_id,
@@ -3267,22 +3019,267 @@ async def start_tictactoe(
             user_id,
         )
 
-    required_level = 10
+    cooldown = 6 * 60 * 60
 
-    if member.level < required_level:
+    rubber = await _has_item(
+        session,
+        chat_id,
+        user_id,
+        RUBBER_PUSSY_ITEM_CODE,
+    )
+
+    if rubber:
+        cooldown *= RUBBER_PUSSY_COOLDOWN_MULTIPLIER
+
+    remaining = cooldown_remaining(
+        member.last_masturbation_at,
+        cooldown,
+    )
+
+    if remaining:
         return ServiceResult(
             False,
             (
-                f"🔒 Крестики-нолики открываются "
-                f"на <b>{required_level} уровне</b>."
+                "⏳ Команда пока недоступна.\n"
+                f"Осталось: <b>{format_seconds(remaining)}</b>."
             ),
+        )
+
+    gain = 0.0
+
+    if rubber:
+        gain = RNG.uniform(
+            RUBBER_PUSSY_MASTURBATION_MIN,
+            RUBBER_PUSSY_MASTURBATION_MAX,
+        )
+
+    member.penis_size = round(
+        max(
+            0.0,
+            member.penis_size + gain,
+        ),
+        2,
+    )
+
+    member.last_masturbation_at = utcnow()
+
+    return ServiceResult(
+        True,
+        (
+            "😏 Действие выполнено.\n"
+            f"📏 Размер: <b>{member.penis_size:.2f} см</b>"
+            + (
+                f"\n📈 Рост: <b>+{gain:.2f} см</b>"
+                if gain > 0
+                else ""
+            )
+        ),
+        changed=True,
+    )
+
+
+# ============================================================================
+# ROB
+# ============================================================================
+
+
+async def rob_user(
+    session: AsyncSession,
+    chat_id: int,
+    actor_id: int,
+    target_id: int,
+) -> ServiceResult:
+    if actor_id == target_id:
+        return ServiceResult(
+            False,
+            "😐 Себя грабить нельзя.",
+        )
+
+    actor = await get_member(
+        session,
+        chat_id,
+        actor_id,
+    )
+
+    target = await get_member(
+        session,
+        chat_id,
+        target_id,
+    )
+
+    if actor is None or target is None:
+        return ServiceResult(
+            False,
+            "❌ Пользователь не найден.",
+        )
+
+    remaining = cooldown_remaining(
+        actor.last_rob_at,
+        ROB_COOLDOWN_SECONDS,
+    )
+
+    if remaining:
+        return ServiceResult(
+            False,
+            (
+                "⏳ Ограбление на cooldown.\n"
+                f"Осталось: <b>{format_seconds(remaining)}</b>."
+            ),
+        )
+
+    if actor.penis_size <= target.penis_size:
+        return ServiceResult(
+            False,
+            (
+                "❌ Ограбить можно только пользователя "
+                "с меньшим размером."
+            ),
+        )
+
+    if target.balance <= 0:
+        return ServiceResult(
+            False,
+            "❌ У цели нет арахиса.",
+        )
+
+    chance = RNG.uniform(
+        ROB_MIN_SUCCESS_CHANCE,
+        ROB_MAX_SUCCESS_CHANCE,
+    )
+
+    actor.last_rob_at = utcnow()
+
+    if RNG.random() > chance:
+        return ServiceResult(
+            True,
+            "🥷 Ограбление провалилось.",
+            changed=True,
+        )
+
+    percent = RNG.uniform(
+        ROB_MIN_REWARD_PERCENT,
+        ROB_MAX_REWARD_PERCENT,
+    )
+
+    amount = max(
+        1,
+        int(
+            target.balance
+            * percent
+        ),
+    )
+
+    amount = min(
+        amount,
+        target.balance,
+    )
+
+    await change_balance(
+        session,
+        chat_id,
+        target.user_id,
+        -amount,
+        "rob_loss",
+        f"Ограбление пользователем {actor_id}",
+    )
+
+    await change_balance(
+        session,
+        chat_id,
+        actor_id,
+        amount,
+        "rob_reward",
+        f"Ограбление пользователя {target_id}",
+    )
+
+    return ServiceResult(
+        True,
+        (
+            "🥷 Ограбление успешно!\n"
+            f"💰 Получено: <b>{format_balance(amount)}</b> 🥜"
+        ),
+        changed=True,
+    )
+
+
+# ============================================================================
+# DISEASE
+# ============================================================================
+
+
+async def reconcile_disease(
+    session: AsyncSession,
+    member: ChatMember,
+) -> None:
+    if not member.has_disease:
+        return
+
+    now = utcnow()
+
+    if member.next_disease_tick is None:
+        member.next_disease_tick = (
+            now
+            + timedelta(
+                seconds=DISEASE_TICK_INTERVAL
+            )
+        )
+        return
+
+    ticks = 0
+
+    while (
+        member.next_disease_tick <= now
+        and ticks < 24
+    ):
+        member.penis_size = round(
+            max(
+                0.0,
+                member.penis_size
+                - DISEASE_SIZE_LOSS_PER_TICK,
+            ),
+            2,
+        )
+
+        member.next_disease_tick += timedelta(
+            seconds=DISEASE_TICK_INTERVAL
+        )
+
+        ticks += 1
+
+
+async def use_medicine(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+) -> ServiceResult:
+    member = await get_member(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    if member is None:
+        return ServiceResult(
+            False,
+            "❌ Профиль не найден.",
+        )
+
+    await reconcile_disease(
+        session,
+        member,
+    )
+
+    if not member.has_disease:
+        return ServiceResult(
+            False,
+            "🧼 Болезни нет.",
         )
 
     _, error = await can_afford(
         session,
         chat_id,
         user_id,
-        bet,
+        DISEASE_MEDICINE_COST,
     )
 
     if error:
@@ -3291,343 +3288,1652 @@ async def start_tictactoe(
             error,
         )
 
-    existing = await session.execute(
-        select(TicTacToeGame).where(
-            TicTacToeGame.chat_id == chat_id,
-            TicTacToeGame.status.in_(
-                ["waiting", "playing"]
-            ),
-        )
-    )
-
-    for game in existing.scalars().all():
-        if (
-            game.player_x_id == user_id
-            or game.player_o_id == user_id
-        ):
-            return ServiceResult(
-                False,
-                "❌ У тебя уже есть активная игра.",
-            )
-
-    # Ставка резервируется сразу.
     await change_balance(
         session,
         chat_id,
         user_id,
-        -bet,
-        "ttt_bet",
-        "Ставка в крестики-нолики",
+        -DISEASE_MEDICINE_COST,
+        "medicine",
+        "Лекарство",
     )
 
-    game = TicTacToeGame(
-        chat_id=chat_id,
-        player_x_id=user_id,
-        current_player_id=user_id,
-        board="---------",
-        status="waiting",
-        bet=bet,
-    )
-
-    session.add(game)
-
-    await session.flush()
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎮 Присоединиться",
-                    callback_data=(
-                        f"tttjoin:{game.id}"
-                    ),
-                )
-            ]
-        ]
-    )
+    member.has_disease = False
+    member.disease_since = None
+    member.next_disease_tick = None
 
     return ServiceResult(
         True,
-        (
-            "⭕❌ <b>Крестики-нолики</b>\n\n"
-            "Игрок X создал игру.\n"
-            f"Ставка: <b>{format_balance(bet)}</b> 🥜\n\n"
-            "Нажми кнопку, чтобы присоединиться."
-        ),
+        "💊 Лекарство использовано. Болезнь снята.",
         changed=True,
-        keyboard=keyboard,
     )
 
 
-async def join_tictactoe(
+async def visit_venereologist(
     session: AsyncSession,
-    game_id: int,
+    chat_id: int,
     user_id: int,
 ) -> ServiceResult:
-
-    game = await session.get(
-        TicTacToeGame,
-        game_id,
+    member = await get_member(
+        session,
+        chat_id,
+        user_id,
     )
 
-    if game is None:
+    if member is None:
         return ServiceResult(
             False,
-            "❌ Игра не найдена.",
-            answer="Игра не найдена.",
-            show_alert=True,
+            "❌ Профиль не найден.",
         )
 
-    if game.status != "waiting":
-        return ServiceResult(
-            False,
-            "❌ В эту игру уже нельзя войти.",
-            answer="Игра недоступна.",
-            show_alert=True,
-        )
-
-    if game.player_x_id == user_id:
-        return ServiceResult(
-            False,
-            "❌ Нельзя играть самому с собой.",
-            answer="Нельзя играть самому с собой.",
-            show_alert=True,
-        )
-
-    member, error = await can_afford(
+    await reconcile_disease(
         session,
-        game.chat_id,
+        member,
+    )
+
+    if not member.has_disease:
+        return ServiceResult(
+            False,
+            "🧑‍⚕️ Болезни нет.",
+        )
+
+    _, error = await can_afford(
+        session,
+        chat_id,
         user_id,
-        game.bet,
+        VENEREOLOGIST_COST,
     )
 
     if error:
         return ServiceResult(
             False,
             error,
-            answer="Недостаточно арахиса.",
-            show_alert=True,
         )
-
-    game.player_o_id = user_id
-    game.current_player_id = game.player_x_id
-    game.status = "playing"
 
     await change_balance(
         session,
-        game.chat_id,
+        chat_id,
         user_id,
-        -game.bet,
-        "ttt_bet",
-        "Ставка в крестики-нолики",
+        -VENEREOLOGIST_COST,
+        "venereologist",
+        "Венеролог",
     )
 
-    return ServiceResult(
-        True,
-        (
-            "⭕❌ <b>Игра началась!</b>\n\n"
-            f"Ставка: <b>{format_balance(game.bet)}</b> 🥜\n"
-            "Ход ❌"
-        ),
-        changed=True,
-        keyboard=ttt_keyboard(game),
-    )
-
-
-async def tictactoe_move(
-    session: AsyncSession,
-    game_id: int,
-    user_id: int,
-    position: int,
-) -> ServiceResult:
-
-    game = await session.get(
-        TicTacToeGame,
-        game_id,
-    )
-
-    if game is None:
-        return ServiceResult(
-            False,
-            "❌ Игра не найдена.",
-            answer="Игра не найдена.",
-            show_alert=True,
-        )
-
-    if game.status != "playing":
-        return ServiceResult(
-            False,
-            "❌ Игра уже завершена.",
-            answer="Игра завершена.",
-            show_alert=True,
-        )
-
-    if user_id != game.current_player_id:
-        return ServiceResult(
-            False,
-            "⏳ Сейчас ход другого игрока.",
-            answer="Сейчас ход другого игрока.",
-            show_alert=True,
-        )
-
-    if not 0 <= position <= 8:
-        return ServiceResult(
-            False,
-            "❌ Некорректная клетка.",
-            answer="Некорректная клетка.",
-            show_alert=True,
-        )
-
-    board = list(
-        game.board
-    )
-
-    if board[position] != "-":
-        return ServiceResult(
-            False,
-            "❌ Клетка занята.",
-            answer="Клетка занята.",
-            show_alert=True,
-        )
-
-    symbol = (
-        "X"
-        if user_id == game.player_x_id
-        else "O"
-    )
-
-    board[position] = symbol
-    game.board = "".join(board)
-
-    winner = ttt_winner(
-        game.board
-    )
-
-    if winner:
-
-        game.status = "finished"
-
-        if winner == "draw":
-            game.winner_id = None
-
-            total = game.bet * 2
-
-            # При ничьей возвращаем обе ставки.
-            await change_balance(
-                session,
-                game.chat_id,
-                game.player_x_id,
-                game.bet,
-                "ttt_refund",
-                "Возврат при ничьей TTT",
-            )
-
-            if game.player_o_id:
-                await change_balance(
-                    session,
-                    game.chat_id,
-                    game.player_o_id,
-                    game.bet,
-                    "ttt_refund",
-                    "Возврат при ничьей TTT",
-                )
-
-            text = (
-                "⭕❌ <b>Ничья!</b>\n\n"
-                "Ставки возвращены."
-            )
-
-        else:
-            winner_id = (
-                game.player_x_id
-                if winner == "X"
-                else game.player_o_id
-            )
-
-            loser_id = (
-                game.player_o_id
-                if winner == "X"
-                else game.player_x_id
-            )
-
-            game.winner_id = winner_id
-
-            if winner_id is not None:
-                await change_balance(
-                    session,
-                    game.chat_id,
-                    winner_id,
-                    game.bet * 2,
-                    "ttt_payout",
-                    "Победа в TTT",
-                )
-
-            winner_member = await get_member(
-                session,
-                game.chat_id,
-                winner_id,
-            )
-
-            loser_member = await get_member(
-                session,
-                game.chat_id,
-                loser_id,
-            )
-
-            if winner_member:
-                winner_member.games_played += 1
-                winner_member.games_won += 1
-                winner_member.total_won += game.bet
-
-            if loser_member:
-                loser_member.games_played += 1
-                loser_member.games_lost += 1
-                loser_member.total_lost += game.bet
-
-            text = (
-                "⭕❌ <b>Игра окончена!</b>\n\n"
-                f"Победитель: "
-                f"<a href=\"tg://user?id={winner_id}\">"
-                f"игрок"
-                f"</a> 🎉\n"
-                f"🏆 Выигрыш: "
-                f"<b>{format_balance(game.bet * 2)}</b> 🥜"
-            )
+    if RNG.random() < VENEREOLOGIST_CURE_CHANCE:
+        member.has_disease = False
+        member.disease_since = None
+        member.next_disease_tick = None
 
         return ServiceResult(
             True,
-            text,
+            "🧑‍⚕️ Лечение прошло успешно. Болезнь снята.",
             changed=True,
-            keyboard=ttt_keyboard(game),
         )
 
-    if game.player_o_id is None:
-        return ServiceResult(
-            False,
-            "❌ В игре нет второго игрока.",
-            answer="Нет второго игрока.",
-            show_alert=True,
-        )
-
-    game.current_player_id = (
-        game.player_o_id
-        if user_id == game.player_x_id
-        else game.player_x_id
+    return ServiceResult(
+        True,
+        "🧑‍⚕️ Лечение не помогло. Попробуй ещё раз позже.",
+        changed=True,
     )
 
-    current_symbol = (
-        "❌"
-        if game.current_player_id
-        == game.player_x_id
-        else "⭕"
+
+# ============================================================================
+# CHILD / SUPPORT / ABORT
+# ============================================================================
+
+
+async def reconcile_child(
+    session: AsyncSession,
+    member: ChatMember,
+) -> None:
+    if not member.has_child:
+        return
+
+    now = utcnow()
+
+    if (
+        member.child_until is not None
+        and member.child_until <= now
+    ):
+        member.has_child = False
+        member.child_until = None
+        member.last_child_support = None
+        return
+
+    if member.last_child_support is None:
+        member.last_child_support = now
+        return
+
+    elapsed_hours = int(
+        (
+            now - member.last_child_support
+        ).total_seconds()
+        // 3600
+    )
+
+    if elapsed_hours <= 0:
+        return
+
+    amount = (
+        elapsed_hours
+        * CHILD_SUPPORT_COST
+    )
+
+    if member.balance >= amount:
+        await change_balance(
+            session,
+            member.chat_id,
+            member.user_id,
+            -amount,
+            "child_support",
+            "Содержание ребёнка",
+        )
+
+    member.last_child_support += timedelta(
+        hours=elapsed_hours
+    )
+
+
+async def child_status(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+) -> ServiceResult:
+    member = await get_member(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    if member is None:
+        return ServiceResult(
+            False,
+            "❌ Профиль не найден.",
+        )
+
+    await reconcile_child(
+        session,
+        member,
+    )
+
+    if not member.has_child:
+        return ServiceResult(
+            True,
+            "👶 Активного ребёнка нет.",
+        )
+
+    remaining = 0
+
+    if member.child_until:
+        remaining = max(
+            0,
+            int(
+                (
+                    member.child_until
+                    - utcnow()
+                ).total_seconds()
+            ),
+        )
+
+    return ServiceResult(
+        True,
+        (
+            "👶 <b>Ребёнок</b>\n\n"
+            f"Осталось: <b>{format_seconds(remaining)}</b>\n"
+            f"Содержание: <b>{format_balance(CHILD_SUPPORT_COST)}</b> 🥜/час."
+        ),
+    )
+
+
+async def abort_child(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+) -> ServiceResult:
+    member = await get_member(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    if member is None:
+        return ServiceResult(
+            False,
+            "❌ Профиль не найден.",
+        )
+
+    await reconcile_child(
+        session,
+        member,
+    )
+
+    if not member.has_child:
+        return ServiceResult(
+            False,
+            "👶 Активного ребёнка нет.",
+        )
+
+    _, error = await can_afford(
+        session,
+        chat_id,
+        user_id,
+        ABORT_COST_VALUE,
+    )
+
+    if error:
+        return ServiceResult(
+            False,
+            error,
+        )
+
+    await change_balance(
+        session,
+        chat_id,
+        user_id,
+        -ABORT_COST_VALUE,
+        "abort",
+        "Игровой аборт",
+    )
+
+    if RNG.random() >= ABORT_SUCCESS_CHANCE:
+        return ServiceResult(
+            True,
+            "❌ Процедура не сработала.",
+            changed=True,
+        )
+
+    member.has_child = False
+    member.child_until = None
+    member.last_child_support = None
+
+    return ServiceResult(
+        True,
+        "🏥 Игровой эффект ребёнка снят.",
+        changed=True,
+    )
+
+
+# ============================================================================
+# STAFF / MODERATION
+# ============================================================================
+
+
+def role_power_value(
+    role: Optional[str],
+) -> int:
+    if role is None:
+        return 0
+
+    return ROLE_POWER.get(
+        role,
+        0,
+    )
+
+
+async def effective_role(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+) -> Optional[str]:
+    if user_id == config.owner_id:
+        return ROLE_OWNER
+
+    return await get_staff_role(
+        session,
+        chat_id,
+        user_id,
+    )
+
+
+async def check_moderation_access(
+    session: AsyncSession,
+    chat_id: int,
+    actor_id: int,
+    command: str,
+) -> tuple[bool, Optional[str]]:
+    role = await effective_role(
+        session,
+        chat_id,
+        actor_id,
+    )
+
+    permission = await get_mod_permission(
+        session,
+        chat_id,
+        command,
+    )
+
+    required = (
+        permission.scope.lower()
+        if permission
+        else DEFAULT_MODERATION_PERMISSIONS.get(
+            command,
+            "staff",
+        )
+    )
+
+    if not can_use_moderation_command(
+        role,
+        required,
+    ):
+        return (
+            False,
+            (
+                "❌ Недостаточно прав.\n"
+                f"Требуется уровень: <b>{required}</b>."
+            ),
+        )
+
+    return True, None
+
+
+async def assign_staff_role(
+    session: AsyncSession,
+    chat_id: int,
+    actor_id: int,
+    target_id: int,
+    role: str,
+) -> ServiceResult:
+    if role not in {
+        ROLE_HEAD_ADMIN,
+        ROLE_ADMIN,
+        ROLE_MODERATOR,
+    }:
+        return ServiceResult(
+            False,
+            "❌ Недопустимая роль.",
+        )
+
+    actor_role = await effective_role(
+        session,
+        chat_id,
+        actor_id,
+    )
+
+    if not can_manage_role(
+        actor_role,
+        role,
+    ):
+        return ServiceResult(
+            False,
+            "❌ У тебя нет права назначать эту роль.",
+        )
+
+    target_role = await get_staff_role(
+        session,
+        chat_id,
+        target_id,
+    )
+
+    if target_role == ROLE_OWNER:
+        return ServiceResult(
+            False,
+            "❌ Владельца изменить нельзя.",
+        )
+
+    if target_role and role_power_value(
+        target_role
+    ) > role_power_value(
+        actor_role
+    ):
+        return ServiceResult(
+            False,
+            "❌ Нельзя изменить роль пользователя выше себя.",
+        )
+
+    staff = await get_staff_member(
+        session,
+        chat_id,
+        target_id,
+    )
+
+    if staff is None:
+        staff = StaffMember(
+            chat_id=chat_id,
+            user_id=target_id,
+            role=role,
+            appointed_by=actor_id,
+        )
+        session.add(staff)
+    else:
+        staff.role = role
+        staff.appointed_by = actor_id
+        staff.updated_at = utcnow()
+
+    await session.flush()
+
+    return ServiceResult(
+        True,
+        (
+            f"🛡 Пользователь <code>{target_id}</code> "
+            f"назначен: <b>{role}</b>."
+        ),
+        changed=True,
+    )
+
+
+async def remove_staff_role(
+    session: AsyncSession,
+    chat_id: int,
+    actor_id: int,
+    target_id: int,
+) -> ServiceResult:
+    actor_role = await effective_role(
+        session,
+        chat_id,
+        actor_id,
+    )
+
+    staff = await get_staff_member(
+        session,
+        chat_id,
+        target_id,
+    )
+
+    if staff is None:
+        return ServiceResult(
+            False,
+            "❌ У пользователя нет staff-роли.",
+        )
+
+    if not can_manage_role(
+        actor_role,
+        staff.role,
+    ):
+        return ServiceResult(
+            False,
+            "❌ У тебя нет права снять эту роль.",
+        )
+
+    await session.delete(
+        staff
     )
 
     return ServiceResult(
         True,
         (
-            "⭕❌ <b>Крестики-нолики</b>\n\n"
-            f"Ход: {current_symbol}"
+            f"🛡 Роль пользователя "
+            f"<code>{target_id}</code> снята."
         ),
         changed=True,
-        keyboard=ttt_keyboard(game),
     )
+
+
+async def set_moderation_permission(
+    session: AsyncSession,
+    chat_id: int,
+    actor_id: int,
+    command: str,
+    scope: str,
+) -> ServiceResult:
+    command = command.lower()
+    scope = scope.lower()
+
+    if scope not in {
+        PERMISSION_STAFF,
+        PERMISSION_ADMIN,
+        PERMISSION_HEAD_ADMIN,
+    }:
+        return ServiceResult(
+            False,
+            "❌ Доступ: staff, admin или head_admin.",
+        )
+
+    actor_role = await effective_role(
+        session,
+        chat_id,
+        actor_id,
+    )
+
+    if role_power_value(actor_role) < ROLE_POWER[ROLE_HEAD_ADMIN]:
+        return ServiceResult(
+            False,
+            "❌ Настраивать права может только head admin или owner.",
+        )
+
+    permission = await session.execute(
+        select(ModPermission).where(
+            ModPermission.chat_id == chat_id,
+            ModPermission.command == command,
+        )
+    )
+
+    row = permission.scalar_one_or_none()
+
+    if row is None:
+        row = ModPermission(
+            chat_id=chat_id,
+            command=command,
+            scope=scope,
+            updated_by=actor_id,
+        )
+        session.add(row)
+    else:
+        row.scope = scope
+        row.updated_by = actor_id
+        row.updated_at = utcnow()
+
+    await session.flush()
+
+    return ServiceResult(
+        True,
+        (
+            f"🛡 Для <code>/{escape(command)}</code> "
+            f"установлен доступ: <b>{escape(scope)}</b>."
+        ),
+        changed=True,
+    )
+
+
+async def _moderation_action(
+    session: AsyncSession,
+    chat_id: int,
+    target_user_id: int,
+    moderator_id: int,
+    action: str,
+    reason: Optional[str] = None,
+    duration: Optional[int] = None,
+) -> ServiceResult:
+    allowed, error = await check_moderation_access(
+        session,
+        chat_id,
+        moderator_id,
+        action,
+    )
+
+    if not allowed:
+        return ServiceResult(
+            False,
+            error or "❌ Нет доступа.",
+        )
+
+    if target_user_id == moderator_id:
+        return ServiceResult(
+            False,
+            "❌ Нельзя применить эту модерацию к себе.",
+        )
+
+    actor_role = await effective_role(
+        session,
+        chat_id,
+        moderator_id,
+    )
+
+    target_role = await effective_role(
+        session,
+        chat_id,
+        target_user_id,
+    )
+
+    if target_role is not None:
+        if role_power_value(target_role) >= role_power_value(actor_role):
+            return ServiceResult(
+                False,
+                "❌ Нельзя модерировать пользователя с равной или более высокой staff-ролью.",
+            )
+
+    session.add(
+        ModerationAction(
+            chat_id=chat_id,
+            target_user_id=target_user_id,
+            moderator_id=moderator_id,
+            action=action,
+            reason=reason,
+            duration=duration,
+        )
+    )
+
+    return ServiceResult(
+        True,
+        f"🛡 Действие <b>{escape(action)}</b> зарегистрировано.",
+        changed=True,
+    )
+
+
+async def add_warning(
+    session: AsyncSession,
+    chat_id: int,
+    target_user_id: int,
+    moderator_id: int,
+    reason: str = "",
+) -> ServiceResult:
+    result = await _moderation_action(
+        session,
+        chat_id,
+        target_user_id,
+        moderator_id,
+        "warn",
+        reason,
+    )
+
+    if not result.success:
+        return result
+
+    session.add(
+        Warning(
+            chat_id=chat_id,
+            user_id=target_user_id,
+            moderator_id=moderator_id,
+            reason=reason or None,
+            active=True,
+        )
+    )
+
+    return ServiceResult(
+        True,
+        (
+            f"⚠️ Пользователь <code>{target_user_id}</code> "
+            "получил предупреждение."
+        ),
+        changed=True,
+    )
+
+
+async def remove_warning(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+    moderator_id: int,
+) -> ServiceResult:
+    result = await _moderation_action(
+        session,
+        chat_id,
+        user_id,
+        moderator_id,
+        "unwarn",
+    )
+
+    if not result.success:
+        return result
+
+    query = await session.execute(
+        select(Warning)
+        .where(
+            Warning.chat_id == chat_id,
+            Warning.user_id == user_id,
+            Warning.active.is_(True),
+        )
+        .order_by(
+            Warning.id.desc()
+        )
+    )
+
+    warning = query.scalars().first()
+
+    if warning is None:
+        return ServiceResult(
+            False,
+            "❌ Активных предупреждений нет.",
+        )
+
+    warning.active = False
+
+    return ServiceResult(
+        True,
+        "✅ Последнее предупреждение снято.",
+        changed=True,
+    )
+
+
+async def get_warnings(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+) -> str:
+    result = await session.execute(
+        select(Warning)
+        .where(
+            Warning.chat_id == chat_id,
+            Warning.user_id == user_id,
+            Warning.active.is_(True),
+        )
+        .order_by(
+            Warning.id.asc()
+        )
+    )
+
+    warnings = list(
+        result.scalars().all()
+    )
+
+    if not warnings:
+        return "⚠️ Активных предупреждений нет."
+
+    lines = [
+        f"⚠️ <b>Предупреждения: {len(warnings)}</b>"
+    ]
+
+    for index, warning in enumerate(
+        warnings,
+        1,
+    ):
+        reason = (
+            escape(warning.reason)
+            if warning.reason
+            else "без причины"
+        )
+
+        lines.append(
+            f"{index}. {reason}"
+        )
+
+    return "\n".join(lines)
+
+
+async def moderate_mute(
+    session: AsyncSession,
+    bot: Bot,
+    chat_id: int,
+    target_user_id: int,
+    moderator_id: int,
+    duration_minutes: int = 60,
+) -> ServiceResult:
+    if duration_minutes <= 0:
+        return ServiceResult(
+            False,
+            "❌ Время мута должно быть больше 0.",
+        )
+
+    result = await _moderation_action(
+        session,
+        chat_id,
+        target_user_id,
+        moderator_id,
+        "mute",
+        duration=duration_minutes,
+    )
+
+    if not result.success:
+        return result
+
+    try:
+        from aiogram.types import ChatPermissions
+
+        until_date = utcnow() + timedelta(
+            minutes=duration_minutes
+        )
+
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=target_user_id,
+            permissions=ChatPermissions(
+                can_send_messages=False,
+                can_send_audios=False,
+                can_send_documents=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_video_notes=False,
+                can_send_voice_notes=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+            ),
+            until_date=until_date,
+        )
+    except (
+        TelegramBadRequest,
+        TelegramForbiddenError,
+    ):
+        return ServiceResult(
+            False,
+            "❌ Telegram не позволил установить мут.",
+        )
+
+    return ServiceResult(
+        True,
+        (
+            f"🔇 Пользователь <code>{target_user_id}</code> "
+            f"замучен на <b>{duration_minutes} мин.</b>"
+        ),
+        changed=True,
+    )
+
+
+async def moderate_unmute(
+    session: AsyncSession,
+    bot: Bot,
+    chat_id: int,
+    target_user_id: int,
+    moderator_id: int,
+) -> ServiceResult:
+    result = await _moderation_action(
+        session,
+        chat_id,
+        target_user_id,
+        moderator_id,
+        "unmute",
+    )
+
+    if not result.success:
+        return result
+
+    try:
+        from aiogram.types import ChatPermissions
+
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=target_user_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            ),
+        )
+    except (
+        TelegramBadRequest,
+        TelegramForbiddenError,
+    ):
+        return ServiceResult(
+            False,
+            "❌ Telegram не позволил снять мут.",
+        )
+
+    return ServiceResult(
+        True,
+        f"🔊 Мут с <code>{target_user_id}</code> снят.",
+        changed=True,
+    )
+
+
+async def moderate_ban(
+    session: AsyncSession,
+    bot: Bot,
+    chat_id: int,
+    target_user_id: int,
+    moderator_id: int,
+    reason: str = "",
+) -> ServiceResult:
+    result = await _moderation_action(
+        session,
+        chat_id,
+        target_user_id,
+        moderator_id,
+        "ban",
+        reason,
+    )
+
+    if not result.success:
+        return result
+
+    try:
+        await bot.ban_chat_member(
+            chat_id=chat_id,
+            user_id=target_user_id,
+        )
+    except (
+        TelegramBadRequest,
+        TelegramForbiddenError,
+    ):
+        return ServiceResult(
+            False,
+            "❌ Telegram не позволил заблокировать пользователя.",
+        )
+
+    return ServiceResult(
+        True,
+        f"🔨 Пользователь <code>{target_user_id}</code> заблокирован.",
+        changed=True,
+    )
+
+
+async def moderate_unban(
+    session: AsyncSession,
+    bot: Bot,
+    chat_id: int,
+    target_user_id: int,
+    moderator_id: int,
+) -> ServiceResult:
+    result = await _moderation_action(
+        session,
+        chat_id,
+        target_user_id,
+        moderator_id,
+        "unban",
+    )
+
+    if not result.success:
+        return result
+
+    try:
+        await bot.unban_chat_member(
+            chat_id=chat_id,
+            user_id=target_user_id,
+            only_if_banned=True,
+        )
+    except (
+        TelegramBadRequest,
+        TelegramForbiddenError,
+    ):
+        return ServiceResult(
+            False,
+            "❌ Telegram не позволил разблокировать пользователя.",
+        )
+
+    return ServiceResult(
+        True,
+        f"🔓 Пользователь <code>{target_user_id}</code> разблокирован.",
+        changed=True,
+    )
+
+
+async def moderate_kick(
+    session: AsyncSession,
+    bot: Bot,
+    chat_id: int,
+    target_user_id: int,
+    moderator_id: int,
+    reason: str = "",
+) -> ServiceResult:
+    result = await _moderation_action(
+        session,
+        chat_id,
+        target_user_id,
+        moderator_id,
+        "kick",
+        reason,
+    )
+
+    if not result.success:
+        return result
+
+    try:
+        await bot.ban_chat_member(
+            chat_id=chat_id,
+            user_id=target_user_id,
+        )
+
+        await bot.unban_chat_member(
+            chat_id=chat_id,
+            user_id=target_user_id,
+        )
+    except (
+        TelegramBadRequest,
+        TelegramForbiddenError,
+    ):
+        return ServiceResult(
+            False,
+            "❌ Telegram не позволил удалить пользователя.",
+        )
+
+    return ServiceResult(
+        True,
+        f"👢 Пользователь <code>{target_user_id}</code> исключён.",
+        changed=True,
+    )
+
+
+async def purge_messages(
+    bot: Bot,
+    chat_id: int,
+    moderator_id: int,
+    count: int,
+) -> ServiceResult:
+    # Telegram purge требует message IDs.
+    # Получить произвольный диапазон без хранения сообщений нельзя.
+    # Поэтому этот метод пока возвращает понятное состояние,
+    # а полноценный purge будет привязан к message_id из middleware/БД.
+    return ServiceResult(
+        False,
+        (
+            "⚠️ /purge пока требует отдельного хранения "
+            "message_id. Не буду делать фальшивое удаление."
+        ),
+    )
+
+
+# ============================================================================
+# OWNER ECONOMY COMMANDS
+# ============================================================================
+
+
+async def admin_give_money(
+    session: AsyncSession,
+    owner_id: int,
+    chat_id: int,
+    target_user_id: int,
+    amount: int,
+) -> ServiceResult:
+    if owner_id != config.owner_id:
+        return ServiceResult(
+            False,
+            "❌ Только owner.",
+        )
+
+    if amount <= 0:
+        return ServiceResult(
+            False,
+            "❌ Сумма должна быть положительной.",
+        )
+
+    await change_balance(
+        session,
+        chat_id,
+        target_user_id,
+        amount,
+        "admin_give",
+        f"Выдано owner {owner_id}",
+    )
+
+    return ServiceResult(
+        True,
+        (
+            f"🥜 Выдано: <b>{format_balance(amount)}</b>.\n"
+            f"Пользователь: <code>{target_user_id}</code>"
+        ),
+        changed=True,
+    )
+
+
+async def admin_take_money(
+    session: AsyncSession,
+    owner_id: int,
+    chat_id: int,
+    target_user_id: int,
+    amount: int,
+) -> ServiceResult:
+    if owner_id != config.owner_id:
+        return ServiceResult(
+            False,
+            "❌ Только owner.",
+        )
+
+    member, error = await can_afford(
+        session,
+        chat_id,
+        target_user_id,
+        amount,
+    )
+
+    if error:
+        return ServiceResult(
+            False,
+            error,
+        )
+
+    await change_balance(
+        session,
+        chat_id,
+        target_user_id,
+        -amount,
+        "admin_take",
+        f"Забрано owner {owner_id}",
+    )
+
+    return ServiceResult(
+        True,
+        (
+            f"🥜 Забрано: <b>{format_balance(amount)}</b>.\n"
+            f"Пользователь: <code>{target_user_id}</code>"
+        ),
+        changed=True,
+    )
+
+
+async def admin_set_balance(
+    session: AsyncSession,
+    owner_id: int,
+    chat_id: int,
+    target_user_id: int,
+    amount: int,
+) -> ServiceResult:
+    if owner_id != config.owner_id:
+        return ServiceResult(
+            False,
+            "❌ Только owner.",
+        )
+
+    if amount < 0:
+        return ServiceResult(
+            False,
+            "❌ Баланс не может быть отрицательным.",
+        )
+
+    member = await get_member(
+        session,
+        chat_id,
+        target_user_id,
+    )
+
+    if member is None:
+        member = await ensure_member(
+            session,
+            chat_id,
+            target_user_id,
+        )
+
+    difference = amount - member.balance
+
+    if difference:
+        await change_balance(
+            session,
+            chat_id,
+            target_user_id,
+            difference,
+            "admin_set_balance",
+            f"Установлено owner {owner_id}",
+        )
+
+    return ServiceResult(
+        True,
+        (
+            f"🥜 Баланс установлен: "
+            f"<b>{format_balance(amount)}</b>."
+        ),
+        changed=True,
+    )
+
+
+async def admin_set_level(
+    session: AsyncSession,
+    owner_id: int,
+    chat_id: int,
+    target_user_id: int,
+    level: int,
+) -> ServiceResult:
+    if owner_id != config.owner_id:
+        return ServiceResult(
+            False,
+            "❌ Только owner.",
+        )
+
+    if level < 1:
+        return ServiceResult(
+            False,
+            "❌ Уровень должен быть не меньше 1.",
+        )
+
+    member = await get_member(
+        session,
+        chat_id,
+        target_user_id,
+    )
+
+    if member is None:
+        member = await ensure_member(
+            session,
+            chat_id,
+            target_user_id,
+        )
+
+    member.level = level
+    member.xp = xp_for_level(
+        level
+    )
+
+    return ServiceResult(
+        True,
+        (
+            f"⭐ Уровень пользователя "
+            f"<code>{target_user_id}</code> установлен: "
+            f"<b>{level}</b>."
+        ),
+        changed=True,
+    )
+
+
+# ============================================================================
+# CASES
+# ============================================================================
+
+
+CASE_REWARDS = {
+    "basic_case": [
+        ("peanuts", 100, 45),
+        ("peanuts", 250, 30),
+        ("item:condom", 1, 15),
+        ("item:lubricant", 1, 8),
+        ("item:dildo", 1, 2),
+    ],
+    "rare_case": [
+        ("peanuts", 500, 40),
+        ("peanuts", 1000, 25),
+        ("item:condom", 2, 12),
+        ("item:lubricant", 2, 10),
+        ("item:dildo", 1, 8),
+        ("item:rubber_pussy", 1, 5),
+    ],
+    "epic_case": [
+        ("peanuts", 2500, 35),
+        ("peanuts", 5000, 25),
+        ("item:dildo", 1, 12),
+        ("item:rubber_pussy", 1, 10),
+        ("item:silicone_implant", 1, 8),
+        ("tag:living_legend", 1, 2),
+    ],
+    "legendary_case": [
+        ("peanuts", 10000, 30),
+        ("peanuts", 25000, 25),
+        ("item:rubber_pussy", 1, 15),
+        ("item:silicone_implant", 1, 15),
+        ("item:dildo", 1, 10),
+        ("tag:living_legend", 1, 5),
+    ],
+}
+
+
+def _weighted_choice(
+    rewards,
+):
+    total = sum(
+        reward[2]
+        for reward in rewards
+    )
+
+    roll = RNG.uniform(
+        0,
+        total,
+    )
+
+    current = 0
+
+    for reward in rewards:
+        current += reward[2]
+
+        if roll <= current:
+            return reward
+
+    return rewards[-1]
+
+
+async def open_case(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+    case_code: str,
+) -> ServiceResult:
+    if case_code not in CASE_REWARDS:
+        return ServiceResult(
+            False,
+            "❌ Неизвестный кейс.",
+        )
+
+    case_item = await get_user_item(
+        session,
+        chat_id,
+        user_id,
+        case_code,
+    )
+
+    if case_item is None or case_item.quantity <= 0:
+        return ServiceResult(
+            False,
+            "❌ У тебя нет этого кейса.",
+        )
+
+    await _consume_user_item(
+        session,
+        case_item,
+    )
+
+    reward_code, amount, _ = _weighted_choice(
+        CASE_REWARDS[case_code]
+    )
+
+    if reward_code.startswith("peanuts"):
+        await change_balance(
+            session,
+            chat_id,
+            user_id,
+            amount,
+            "case_reward",
+            case_code,
+        )
+
+        text = (
+            "📦 <b>Кейс открыт!</b>\n\n"
+            f"🥜 Ты получил <b>{format_balance(amount)}</b>."
+        )
+
+    elif reward_code.startswith("item:"):
+        item_code = reward_code.split(
+            ":",
+            1,
+        )[1]
+
+        item = await get_inventory_item(
+            session,
+            item_code,
+        )
+
+        # Dildo имеет особую механику duplicate compensation.
+        if item_code == DILDO_ITEM_CODE:
+            existing = await get_user_item(
+                session,
+                chat_id,
+                user_id,
+                DILDO_ITEM_CODE,
+            )
+
+            if existing and existing.quantity >= DILDO_MAX_OWNED:
+                await change_balance(
+                    session,
+                    chat_id,
+                    user_id,
+                    DILDO_DUPLICATE_COMPENSATION,
+                    "case_duplicate_compensation",
+                    "Дубликат Dildo",
+                )
+
+                return ServiceResult(
+                    True,
+                    (
+                        "📦 <b>Кейс открыт!</b>\n\n"
+                        "🔁 Выпал повторный Dildo.\n"
+                        f"🥜 Компенсация: "
+                        f"<b>{format_balance(DILDO_DUPLICATE_COMPENSATION)}</b>."
+                    ),
+                    changed=True,
+                )
+
+        await grant_item(
+            session,
+            chat_id,
+            user_id,
+            item_code,
+            amount,
+        )
+
+        name = (
+            item.name
+            if item
+            else item_code
+        )
+
+        text = (
+            "📦 <b>Кейс открыт!</b>\n\n"
+            f"🎁 Получено: <b>{escape(name)}</b>"
+        )
+
+    elif reward_code.startswith("tag:"):
+        tag_code = reward_code.split(
+            ":",
+            1,
+        )[1]
+
+        tag = await grant_tag(
+            session,
+            chat_id,
+            user_id,
+            tag_code,
+            f"case:{case_code}",
+        )
+
+        text = (
+            "📦 <b>Кейс открыт!</b>\n\n"
+            f"🏷 Получен тег: <b>{escape(tag.name if tag else tag_code)}</b>"
+        )
+
+    else:
+        text = "📦 Кейс открыт."
+
+    return ServiceResult(
+        True,
+        text,
+        changed=True,
+    )
+
+
+# ============================================================================
+# INVENTORY
+# ============================================================================
+
+
+async def format_inventory(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+) -> str:
+    items = await get_user_items(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    if not items:
+        return "🎒 Инвентарь пуст."
+
+    lines = [
+        "🎒 <b>Инвентарь</b>"
+    ]
+
+    for user_item in items:
+        item = user_item.item
+
+        if item is None:
+            continue
+
+        extra = ""
+
+        if user_item.uses_left is not None:
+            extra = (
+                f" | использований: "
+                f"<b>{user_item.uses_left}</b>"
+            )
+
+        lines.append(
+            f"• {escape(item.name)} × "
+            f"<b>{user_item.quantity}</b>{extra}"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================================
+# GIVEAWAYS
+# ============================================================================
+
+
+async def create_giveaway(
+    session: AsyncSession,
+    chat_id: int,
+    creator_id: int,
+    prize_type: str,
+    ends_at: datetime,
+    prize_amount: Optional[int] = None,
+    prize_item_code: Optional[str] = None,
+    prize_description: Optional[str] = None,
+) -> ServiceResult:
+    if prize_type not in {
+        "peanuts",
+        "item",
+        "external",
+    }:
+        return ServiceResult(
+            False,
+            "❌ Тип приза: peanuts, item или external.",
+        )
+
+    giveaway = Giveaway(
+        chat_id=chat_id,
+        creator_id=creator_id,
+        prize_type=prize_type,
+        prize_amount=prize_amount,
+        prize_item_code=prize_item_code,
+        prize_description=prize_description,
+        ends_at=ends_at,
+        status="active",
+    )
+
+    session.add(giveaway)
+    await session.flush()
+
+    return ServiceResult(
+        True,
+        (
+            f"🎉 Розыгрыш создан!\n"
+            f"ID: <code>{giveaway.id}</code>"
+        ),
+        changed=True,
+    )
+
+
+async def join_giveaway(
+    session: AsyncSession,
+    giveaway_id: int,
+    chat_id: int,
+    user_id: int,
+) -> ServiceResult:
+    giveaway = await session.get(
+        Giveaway,
+        giveaway_id,
+    )
+
+    if giveaway is None:
+        return ServiceResult(
+            False,
+            "❌ Розыгрыш не найден.",
+        )
+
+    if giveaway.status != "active":
+        return ServiceResult(
+            False,
+            "❌ Розыгрыш уже завершён.",
+        )
+
+    if giveaway.ends_at <= utcnow():
+        return ServiceResult(
+            False,
+            "⏰ Розыгрыш уже закончился.",
+        )
+
+    existing = await session.execute(
+        select(GiveawayParticipant).where(
+            GiveawayParticipant.giveaway_id == giveaway_id,
+            GiveawayParticipant.user_id == user_id,
+        )
+    )
+
+    if existing.scalar_one_or_none():
+        return ServiceResult(
+            False,
+            "❌ Ты уже участвуешь.",
+        )
+
+    session.add(
+        GiveawayParticipant(
+            giveaway_id=giveaway_id,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+    )
+
+    return ServiceResult(
+        True,
+        "🎉 Ты участвуешь в розыгрыше!",
+        changed=True,
+    )
+
+
+async def finish_giveaway(
+    session: AsyncSession,
+    giveaway_id: int,
+) -> ServiceResult:
+    giveaway = await session.get(
+        Giveaway,
+        giveaway_id,
+    )
+
+    if giveaway is None:
+        return ServiceResult(
+            False,
+            "❌ Розыгрыш не найден.",
+        )
+
+    if giveaway.status != "active":
+        return ServiceResult(
+            False,
+            "❌ Розыгрыш уже завершён.",
+        )
+
+    result = await session.execute(
+        select(GiveawayParticipant).where(
+            GiveawayParticipant.giveaway_id == giveaway_id,
+        )
+    )
+
+    participants = list(
+        result.scalars().all()
+    )
+
+    if not participants:
+        giveaway.status = "finished"
+        giveaway.completed_at = utcnow()
+
+        return ServiceResult(
+            True,
+            "🎉 Розыгрыш завершён без участников.",
+            changed=True,
+        )
+
+    winner = RNG.choice(
+        participants
+    )
+
+    giveaway.winner_id = winner.user_id
+    giveaway.status = "finished"
+    giveaway.completed_at = utcnow()
+
+    if giveaway.prize_type == "peanuts":
+        if giveaway.prize_amount:
+            await change_balance(
+                session,
+                giveaway.chat_id,
+                winner.user_id,
+                giveaway.prize_amount,
+                "giveaway_reward",
+                f"Розыгрыш #{giveaway.id}",
+            )
+
+    elif giveaway.prize_type == "item":
+        if giveaway.prize_item_code:
+            await grant_item(
+                session,
+                giveaway.chat_id,
+                winner.user_id,
+                giveaway.prize_item_code,
+            )
+
+    return ServiceResult(
+        True,
+        (
+            "🎉 <b>Розыгрыш завершён!</b>\n"
+            f"Победитель: "
+            f"<a href=\"tg://user?id={winner.user_id}\">"
+            f"игрок</a>"
+        ),
+        changed=True,
+    )
+
+
+# ============================================================================
+# SIMPLE GAME MENU
+# ============================================================================
+
+
+def get_games_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+
+    for game_code, title in [
+        ("coinflip", "🪙 Монетка"),
+        ("dice", "🎲 Кубики"),
+        ("slots", "🎰 Слоты"),
+        ("roulette", "🎡 Рулетка"),
+        ("guess", "🔢 Угадай число"),
+        ("football", "⚽ Футбол"),
+        ("basketball", "🏀 Баскетбол"),
+        ("tictactoe", "⭕❌ TTT"),
+    ]:
+        builder.button(
+            text=title,
+            callback_data=f"game:{game_code}",
+        )
+
+    builder.adjust(2)
+
+    return builder.as_markup()
