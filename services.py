@@ -47,6 +47,8 @@ from core import (
     LEVEL_UNLOCKS,
     LUBRICANT_GROWTH_BONUS,
     LUBRICANT_ITEM_CODE,
+    MASTURBATION_MAX_GAIN,
+    MASTURBATION_MIN_GAIN,
     MODERATION_PERMISSION_LEVEL,
     NORMAL_RP_COST,
     PERMISSION_ADMIN,
@@ -2749,12 +2751,15 @@ async def masturbate(
             ),
         )
 
-    gain = 0
-
     if rubber:
         gain = RNG.uniform(
             RUBBER_PUSSY_MASTURBATION_MIN,
             RUBBER_PUSSY_MASTURBATION_MAX,
+        )
+    else:
+        gain = RNG.uniform(
+            MASTURBATION_MIN_GAIN,
+            MASTURBATION_MAX_GAIN,
         )
 
     member.penis_size = round(
@@ -2774,11 +2779,7 @@ async def masturbate(
         (
             "😏 Действие выполнено.\n"
             f"📏 Размер: <b>{member.penis_size:.2f} см</b>"
-            + (
-                f"\n📈 Рост: <b>+{gain:.2f} см</b>"
-                if gain
-                else ""
-            )
+            f"\n📈 Рост: <b>+{gain:.2f} см</b>"
         ),
         changed=True,
     )
