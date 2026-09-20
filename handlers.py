@@ -15,20 +15,31 @@ from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+from sqlalchemy import select
 
 from core import (
     ADULT_RP_ACTIONS,
     BATTLE_PASS_MAX_LEVEL,
     BATTLE_PASS_REWARDS,
+    CASE_REWARDS,
     RP_ACTIONS,
     get_adult_rp_action,
+    get_feature_required_level,
     get_rp_action_by_alias,
 )
 
 from database import (
     AsyncSessionLocal,
+    InventoryItem,
     User,
+    UserItem,
     get_or_create_chat,
     get_or_create_member,
     get_or_create_user,
@@ -58,6 +69,7 @@ from services import (
     get_leaderboard,
     get_tag_keyboard,
     get_warnings,
+    game_unlocked,
     handle_message,
     join_giveaway,
     join_tictactoe,
@@ -71,7 +83,9 @@ from services import (
     perform_adult_rp,
     perform_rp,
     play_basketball,
+    play_blackjack,
     play_coinflip,
+    play_crash,
     play_dice,
     play_football,
     play_guess,
@@ -127,7 +141,10 @@ async def reply(
         return None
 
     try:
-        return await message.answer(text, **kwargs)
+        return await message.answer(
+            text,
+            **kwargs,
+        )
     except TelegramForbiddenError:
         logger.warning(
             "Telegram запретил отправку сообщения chat_id=%s",
@@ -142,7 +159,9 @@ async def reply(
     return None
 
 
-async def get_or_prepare_member(message: Message):
+async def get_or_prepare_member(
+    message: Message,
+):
     if not message.from_user:
         return None
 
@@ -217,6 +236,16 @@ def games_keyboard() -> InlineKeyboardMarkup:
                     callback_data="game:tictactoe",
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    text="🃏 Blackjack",
+                    callback_data="game:blackjack",
+                ),
+                InlineKeyboardButton(
+                    text="🚀 Crash",
+                    callback_data="game:crash",
+                ),
+            ],
         ]
     )
 
@@ -234,6 +263,66 @@ def back_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+async def build_case_keyboard(
+    session,
+    chat_id: int,
+    user_id: int,
+) -> Optional[InlineKeyboardMarkup]:
+    query = await session.execute(
+        select(
+            InventoryItem.code,
+            UserItem.quantity,
+        )
+        .join(
+            UserItem,
+            UserItem.item_id == InventoryItem.id,
+        )
+        .where(
+            UserItem.chat_id == chat_id,
+            UserItem.user_id == user_id,
+            InventoryItem.code.in_(tuple(CASE_REWARDS.keys())),
+            UserItem.quantity > 0,
+        )
+        .order_by(InventoryItem.id.asc())
+    )
+
+    rows = []
+
+    titles = {
+        "basic_case": "📦 Basic Case",
+        "rare_case": "💎 Rare Case",
+        "epic_case": "🔥 Epic Case",
+        "legendary_case": "👑 Legendary Case",
+    }
+
+    for code, quantity in query.all():
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{titles.get(code, code)} ×{quantity}",
+                    callback_data=f"case:{code}",
+                )
+            ]
+        )
+
+    if not rows:
+        return None
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows,
+    )
+
+
+async def commit_result(
+    session,
+    result: ServiceResult,
+) -> None:
+    if result.success:
+        await session.commit()
+    else:
+        await session.rollback()
+
+
 # ============================================================================
 # PROFILE TARGET
 # ============================================================================
@@ -243,14 +332,26 @@ async def resolve_user_id(
     message: Message,
     command: Optional[CommandObject] = None,
 ) -> Optional[int]:
-    if message.reply_to_message and message.reply_to_message.from_user:
+    if (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+    ):
         return message.reply_to_message.from_user.id
 
-    args = (command.args if command else "") or ""
+    args = (
+        command.args
+        if command is not None
+        else ""
+    ) or ""
+
     args = args.strip()
 
     if not args:
-        return message.from_user.id if message.from_user else None
+        return (
+            message.from_user.id
+            if message.from_user
+            else None
+        )
 
     first = args.split()[0]
 
@@ -265,8 +366,6 @@ async def resolve_user_id(
         return None
 
     async with AsyncSessionLocal() as session:
-        from sqlalchemy import select
-
         result = await session.execute(
             select(User.id).where(
                 User.username.ilike(username)
@@ -276,7 +375,9 @@ async def resolve_user_id(
         return result.scalar_one_or_none()
 
 
-def reply_target_id(message: Message) -> Optional[int]:
+def reply_target_id(
+    message: Message,
+) -> Optional[int]:
     if not message.reply_to_message:
         return None
 
@@ -339,7 +440,9 @@ async def cmd_help(message: Message) -> None:
             "/guess 100 5\n"
             "/football 100\n"
             "/basketball 100\n"
-            "/ttt\n\n"
+            "/ttt\n"
+            "/blackjack 100\n"
+            "/crash 100 2.00\n\n"
             "<b>💰 Экономика</b>\n"
             "/pay 100 ответом\n"
             "/masturbate\n"
@@ -374,6 +477,43 @@ async def cmd_help(message: Message) -> None:
 # ============================================================================
 
 
+def profile_keyboard(
+    member,
+) -> Optional[InlineKeyboardMarkup]:
+    buttons = []
+
+    if member.has_disease:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="💊 Лекарство",
+                    callback_data=f"profile:medicine:{member.user_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🧑‍⚕️ Венеролог",
+                    callback_data=f"profile:venereologist:{member.user_id}",
+                ),
+            ]
+        )
+
+    if member.has_child:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="🏥 Аборт",
+                    callback_data=f"profile:abort:{member.user_id}",
+                )
+            ]
+        )
+
+    if not buttons:
+        return None
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=buttons,
+    )
+
+
 @router.message(Command("profile"))
 async def cmd_profile(
     message: Message,
@@ -403,6 +543,14 @@ async def cmd_profile(
                 chat_id=message.chat.id,
                 user_id=target_id,
             )
+
+            member = await get_or_create_member(
+                session=session,
+                chat_id=message.chat.id,
+                user_id=target_id,
+            )
+
+            keyboard = profile_keyboard(member)
         else:
             text = await format_other_profile(
                 session=session,
@@ -410,45 +558,7 @@ async def cmd_profile(
                 target_user_id=target_id,
             )
 
-        keyboard = None
-
-        if target_id == message.from_user.id:
-            member = await get_or_create_member(
-                session=session,
-                chat_id=message.chat.id,
-                user_id=target_id,
-            )
-
-            buttons = []
-
-            if member.has_disease:
-                buttons.append(
-                    [
-                        InlineKeyboardButton(
-                            text="💊 Лекарство",
-                            callback_data=f"profile:medicine:{target_id}",
-                        ),
-                        InlineKeyboardButton(
-                            text="🧑‍⚕️ Венеролог",
-                            callback_data=f"profile:venereologist:{target_id}",
-                        ),
-                    ]
-                )
-
-            if member.has_child:
-                buttons.append(
-                    [
-                        InlineKeyboardButton(
-                            text="🏥 Аборт",
-                            callback_data=f"profile:abort:{target_id}",
-                        )
-                    ]
-                )
-
-            if buttons:
-                keyboard = InlineKeyboardMarkup(
-                    inline_keyboard=buttons
-                )
+            keyboard = None
 
     await reply(
         message,
@@ -457,15 +567,22 @@ async def cmd_profile(
     )
 
 
-@router.callback_query(F.data.startswith("profile:"))
+@router.callback_query(
+    F.data.startswith("profile:")
+)
 async def callback_profile_action(
     callback: CallbackQuery,
 ) -> None:
-    if not callback.message or not callback.from_user:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
         await callback.answer()
         return
 
-    parts = (callback.data or "").split(":")
+    parts = (
+        callback.data or ""
+    ).split(":")
 
     if len(parts) != 3:
         await callback.answer(
@@ -476,9 +593,9 @@ async def callback_profile_action(
 
     action = parts[1]
 
-    try:
-        target_id = int(parts[2])
-    except ValueError:
+    target_id = parse_integer(parts[2])
+
+    if target_id is None:
         await callback.answer(
             "Некорректный профиль.",
             show_alert=True,
@@ -514,8 +631,10 @@ async def callback_profile_action(
             user_id=target_id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
         text = await format_profile(
             session=session,
@@ -529,39 +648,7 @@ async def callback_profile_action(
             user_id=target_id,
         )
 
-        buttons = []
-
-        if member.has_disease:
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text="💊 Лекарство",
-                        callback_data=f"profile:medicine:{target_id}",
-                    ),
-                    InlineKeyboardButton(
-                        text="🧑‍⚕️ Венеролог",
-                        callback_data=f"profile:venereologist:{target_id}",
-                    ),
-                ]
-            )
-
-        if member.has_child:
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text="🏥 Аборт",
-                        callback_data=f"profile:abort:{target_id}",
-                    )
-                ]
-            )
-
-        keyboard = (
-            InlineKeyboardMarkup(
-                inline_keyboard=buttons
-            )
-            if buttons
-            else None
-        )
+        keyboard = profile_keyboard(member)
 
     await callback.answer(
         result.answer or result.message,
@@ -596,7 +683,10 @@ async def cmd_stats(message: Message) -> None:
             user_id=target_id,
         )
 
-    await reply(message, text)
+    await reply(
+        message,
+        text,
+    )
 
 
 @router.message(Command("balance"))
@@ -633,7 +723,17 @@ async def cmd_inventory(message: Message) -> None:
             user_id=message.from_user.id,
         )
 
-    await reply(message, text)
+        keyboard = await build_case_keyboard(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+
+    await reply(
+        message,
+        text,
+        reply_markup=keyboard,
+    )
 
 
 @router.message(Command("tag"))
@@ -660,9 +760,16 @@ async def cmd_tag(message: Message) -> None:
     )
 
 
-@router.callback_query(F.data.startswith("tagselect:"))
-async def callback_tag_select(callback: CallbackQuery) -> None:
-    if not callback.message or not callback.from_user:
+@router.callback_query(
+    F.data.startswith("tagselect:")
+)
+async def callback_tag_select(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
         await callback.answer()
         return
 
@@ -685,8 +792,10 @@ async def callback_tag_select(callback: CallbackQuery) -> None:
             tag_id=tag_id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
         keyboard = await get_tag_keyboard(
             session=session,
@@ -728,7 +837,9 @@ async def cmd_battlepass(message: Message) -> None:
         )
 
         current_xp = member.battle_pass_xp
+
         level_xp = current_xp % 100
+
         remaining = (
             0
             if level >= BATTLE_PASS_MAX_LEVEL
@@ -741,9 +852,21 @@ async def cmd_battlepass(message: Message) -> None:
 
         if reward is not None:
             reward_text = str(
-                getattr(reward, "description", None)
-                or getattr(reward, "name", None)
-                or getattr(reward, "reward_type", None)
+                getattr(
+                    reward,
+                    "description",
+                    None,
+                )
+                or getattr(
+                    reward,
+                    "name",
+                    None,
+                )
+                or getattr(
+                    reward,
+                    "reward_type",
+                    None,
+                )
                 or reward
             )
 
@@ -754,7 +877,8 @@ async def cmd_battlepass(message: Message) -> None:
             f"Уровень: <b>{level}/{BATTLE_PASS_MAX_LEVEL}</b>\n"
             f"XP сезона: <b>{current_xp}</b>\n"
             f"До следующего уровня: <b>{remaining}</b>\n\n"
-            f"🎁 Награда текущего уровня:\n{escape(reward_text)}"
+            f"🎁 Награда текущего уровня:\n"
+            f"{escape(reward_text)}"
         ),
     )
 
@@ -774,7 +898,10 @@ async def cmd_top(message: Message) -> None:
             chat_id=message.chat.id,
         )
 
-    await reply(message, text)
+    await reply(
+        message,
+        text,
+    )
 
 
 @router.message(Command("topsize"))
@@ -797,10 +924,14 @@ async def cmd_topsize(message: Message) -> None:
             "📏 <b>Топ по размеру</b>"
         ]
 
-        for index, member in enumerate(members, 1):
+        for index, member in enumerate(
+            members,
+            1,
+        ):
             lines.append(
                 f'{index}. '
-                f'<a href="tg://user?id={member.user_id}">Игрок</a> — '
+                f'<a href="tg://user?id={member.user_id}">'
+                "Игрок</a> — "
                 f"<b>{member.penis_size:.2f} см</b>"
             )
 
@@ -824,10 +955,15 @@ async def cmd_bonus(message: Message) -> None:
             user_id=message.from_user.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 # ============================================================================
@@ -846,12 +982,16 @@ async def cmd_pay(
     if not message.reply_to_message:
         await reply(
             message,
-            "💸 Используй /pay ответом на сообщение.\n"
-            "Пример: <code>/pay 500</code>",
+            (
+                "💸 Используй /pay ответом на сообщение.\n"
+                "Пример: <code>/pay 500</code>"
+            ),
         )
         return
 
-    amount = parse_integer(command.args)
+    amount = parse_integer(
+        command.args
+    )
 
     if amount is None or amount <= 0:
         await reply(
@@ -874,10 +1014,15 @@ async def cmd_pay(
             amount=amount,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("masturbate"))
@@ -892,10 +1037,15 @@ async def cmd_masturbate(message: Message) -> None:
             user_id=message.from_user.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("rob"))
@@ -923,10 +1073,15 @@ async def cmd_rob(message: Message) -> None:
             target_id=target.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 # ============================================================================
@@ -971,10 +1126,15 @@ async def cmd_coinflip(
             bet=bet,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("dice"))
@@ -1002,10 +1162,15 @@ async def cmd_dice(
             bet=bet,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("slots"))
@@ -1033,10 +1198,15 @@ async def cmd_slots(
             bet=bet,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("roulette"))
@@ -1047,7 +1217,9 @@ async def cmd_roulette(
     if not message.from_user:
         return
 
-    args = (command.args or "").split()
+    args = (
+        command.args or ""
+    ).split()
 
     if len(args) < 2:
         await reply(
@@ -1071,13 +1243,18 @@ async def cmd_roulette(
             chat_id=message.chat.id,
             user_id=message.from_user.id,
             bet=bet,
-            color=args[1],
+            choice=args[1],
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("guess"))
@@ -1088,7 +1265,9 @@ async def cmd_guess(
     if not message.from_user:
         return
 
-    args = (command.args or "").split()
+    args = (
+        command.args or ""
+    ).split()
 
     if len(args) != 2:
         await reply(
@@ -1116,10 +1295,15 @@ async def cmd_guess(
             number=number,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("football"))
@@ -1147,10 +1331,15 @@ async def cmd_football(
             bet=bet,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("basketball"))
@@ -1178,10 +1367,111 @@ async def cmd_basketball(
             bet=bet,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
+
+
+@router.message(Command("blackjack"))
+async def cmd_blackjack(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    if not message.from_user:
+        return
+
+    bet = parse_integer(command.args)
+
+    if bet is None:
+        await reply(
+            message,
+            "🃏 Пример: <code>/blackjack 100</code>",
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await play_blackjack(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            bet=bet,
+        )
+
+        await commit_result(
+            session,
+            result,
+        )
+
+    await reply(
+        message,
+        result.message,
+    )
+
+
+@router.message(Command("crash"))
+async def cmd_crash(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    if not message.from_user:
+        return
+
+    args = (
+        command.args or ""
+    ).split()
+
+    if not args:
+        await reply(
+            message,
+            "🚀 Пример: <code>/crash 100 2.00</code>",
+        )
+        return
+
+    bet = parse_integer(args[0])
+
+    if bet is None:
+        await reply(
+            message,
+            "❌ Некорректная ставка.",
+        )
+        return
+
+    cashout = 2.0
+
+    if len(args) >= 2:
+        try:
+            cashout = float(args[1])
+        except ValueError:
+            await reply(
+                message,
+                "❌ Некорректный множитель.",
+            )
+            return
+
+    async with AsyncSessionLocal() as session:
+        result = await play_crash(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            bet=bet,
+            cashout_multiplier=cashout,
+        )
+
+        await commit_result(
+            session,
+            result,
+        )
+
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("ttt"))
@@ -1196,8 +1486,10 @@ async def cmd_ttt(message: Message) -> None:
             user_id=message.from_user.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
     await reply(
         message,
@@ -1206,17 +1498,24 @@ async def cmd_ttt(message: Message) -> None:
     )
 
 
-@router.callback_query(F.data.startswith("tttjoin:"))
-async def callback_ttt_join(callback: CallbackQuery) -> None:
-    if not callback.message or not callback.from_user:
+@router.callback_query(
+    F.data.startswith("tttjoin:")
+)
+async def callback_ttt_join(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
         await callback.answer()
         return
 
-    try:
-        game_id = int(
-            (callback.data or "").split(":", 1)[1]
-        )
-    except (ValueError, IndexError):
+    game_id = parse_integer(
+        (callback.data or "").split(":", 1)[1]
+    )
+
+    if game_id is None:
         await callback.answer(
             "Некорректная игра.",
             show_alert=True,
@@ -1230,8 +1529,10 @@ async def callback_ttt_join(callback: CallbackQuery) -> None:
             user_id=callback.from_user.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
     await callback.answer(
         result.answer or result.message,
@@ -1248,13 +1549,22 @@ async def callback_ttt_join(callback: CallbackQuery) -> None:
             pass
 
 
-@router.callback_query(F.data.startswith("tttmove:"))
-async def callback_ttt_move(callback: CallbackQuery) -> None:
-    if not callback.message or not callback.from_user:
+@router.callback_query(
+    F.data.startswith("ttt:")
+)
+async def callback_ttt_move(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
         await callback.answer()
         return
 
-    parts = (callback.data or "").split(":")
+    parts = (
+        callback.data or ""
+    ).split(":")
 
     if len(parts) != 3:
         await callback.answer(
@@ -1281,8 +1591,10 @@ async def callback_ttt_move(callback: CallbackQuery) -> None:
             position=cell,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
     await callback.answer(
         result.answer or result.message,
@@ -1299,7 +1611,9 @@ async def callback_ttt_move(callback: CallbackQuery) -> None:
             pass
 
 
-@router.callback_query(F.data == "games:menu")
+@router.callback_query(
+    F.data == "games:menu"
+)
 async def callback_games_menu(
     callback: CallbackQuery,
 ) -> None:
@@ -1321,15 +1635,47 @@ async def callback_games_menu(
         pass
 
 
-@router.callback_query(F.data.startswith("game:"))
+@router.callback_query(
+    F.data.startswith("game:")
+)
 async def callback_game(
     callback: CallbackQuery,
 ) -> None:
-    if not callback.message:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
         await callback.answer()
         return
 
-    game_type = (callback.data or "").split(":", 1)[1]
+    game_type = (
+        callback.data or ""
+    ).split(":", 1)[1]
+
+    required = get_feature_required_level(
+        game_type
+    )
+
+    async with AsyncSessionLocal() as session:
+        member = await get_or_create_member(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
+        if not game_unlocked(
+            member,
+            game_type,
+        ):
+            await callback.answer(
+                (
+                    f"🔒 Игра открывается на "
+                    f"<b>{required}</b> уровне.\n"
+                    f"Твой уровень: <b>{member.level}</b>."
+                ),
+                show_alert=True,
+            )
+            return
 
     instructions = {
         "coinflip": "🪙 Используй <code>/coinflip 100</code>",
@@ -1340,6 +1686,8 @@ async def callback_game(
         "football": "⚽ Используй <code>/football 100</code>",
         "basketball": "🏀 Используй <code>/basketball 100</code>",
         "tictactoe": "⭕❌ Используй <code>/ttt</code>",
+        "blackjack": "🃏 Используй <code>/blackjack 100</code>",
+        "crash": "🚀 Используй <code>/crash 100 2.00</code>",
     }
 
     text = instructions.get(game_type)
@@ -1365,7 +1713,9 @@ async def callback_game(
 def parse_rp_text(
     message: Message,
 ) -> tuple[str, str]:
-    text = (message.text or "").strip()
+    text = (
+        message.text or ""
+    ).strip()
 
     if text.startswith("/") or text.startswith("!"):
         text = text[1:].strip()
@@ -1375,11 +1725,18 @@ def parse_rp_text(
     if not parts:
         return "", ""
 
-    words = [part.lower() for part in parts]
+    words = [
+        part.lower()
+        for part in parts
+    ]
+
     candidates: set[str] = set()
 
     for data in RP_ACTIONS.values():
-        for alias in data.get("aliases", ()):
+        for alias in data.get(
+            "aliases",
+            (),
+        ):
             candidates.add(
                 " ".join(
                     str(alias).lower().split()
@@ -1423,23 +1780,32 @@ async def execute_rp(
     if not message.from_user:
         return None
 
-    action_alias, target_text = parse_rp_text(message)
+    action_alias, target_text = parse_rp_text(
+        message
+    )
 
     if not action_alias:
         return None
 
-    adult_action = get_adult_rp_action(action_alias)
+    adult_action = get_adult_rp_action(
+        action_alias
+    )
 
     if adult_action is not None:
         target_id = None
 
         if message.reply_to_message:
-            target = message.reply_to_message.from_user
+            target = (
+                message.reply_to_message.from_user
+            )
 
             if target:
                 target_id = target.id
 
-        if target_id is None and target_text:
+        if (
+            target_id is None
+            and target_text
+        ):
             parsed = parse_integer(
                 target_text.split()[0]
             )
@@ -1467,12 +1833,16 @@ async def execute_rp(
                 action=adult_action.key,
             )
 
-            if result.success:
-                await session.commit()
+            await commit_result(
+                session,
+                result,
+            )
 
         return result
 
-    action = get_rp_action_by_alias(action_alias)
+    action = get_rp_action_by_alias(
+        action_alias
+    )
 
     if action is None:
         return None
@@ -1480,12 +1850,17 @@ async def execute_rp(
     target_id = None
 
     if message.reply_to_message:
-        target = message.reply_to_message.from_user
+        target = (
+            message.reply_to_message.from_user
+        )
 
         if target:
             target_id = target.id
 
-    if target_id is None and target_text:
+    if (
+        target_id is None
+        and target_text
+    ):
         parsed = parse_integer(
             target_text.split()[0]
         )
@@ -1513,8 +1888,10 @@ async def execute_rp(
             action=action[0],
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
     return result
 
@@ -1541,7 +1918,9 @@ async def cmd_warn(
         )
         return
 
-    reason = (command.args or "").strip()
+    reason = (
+        command.args or ""
+    ).strip()
 
     async with AsyncSessionLocal() as session:
         result = await add_warning(
@@ -1552,14 +1931,21 @@ async def cmd_warn(
             reason=reason,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("unwarn"))
-async def cmd_unwarn(message: Message) -> None:
+async def cmd_unwarn(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -1580,14 +1966,21 @@ async def cmd_unwarn(message: Message) -> None:
             moderator_id=message.from_user.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("warnings"))
-async def cmd_warnings(message: Message) -> None:
+async def cmd_warnings(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -1603,7 +1996,10 @@ async def cmd_warnings(message: Message) -> None:
             user_id=target_id,
         )
 
-    await reply(message, text)
+    await reply(
+        message,
+        text,
+    )
 
 
 @router.message(Command("mute"))
@@ -1625,7 +2021,9 @@ async def cmd_mute(
 
     duration = 60
 
-    args = (command.args or "").split()
+    args = (
+        command.args or ""
+    ).split()
 
     if args:
         parsed = parse_integer(args[0])
@@ -1643,14 +2041,21 @@ async def cmd_mute(
             duration_minutes=duration,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("unmute"))
-async def cmd_unmute(message: Message) -> None:
+async def cmd_unmute(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -1672,10 +2077,15 @@ async def cmd_unmute(message: Message) -> None:
             moderator_id=message.from_user.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("ban"))
@@ -1695,7 +2105,9 @@ async def cmd_ban(
         )
         return
 
-    reason = (command.args or "").strip()
+    reason = (
+        command.args or ""
+    ).strip()
 
     async with AsyncSessionLocal() as session:
         result = await moderate_ban(
@@ -1707,10 +2119,15 @@ async def cmd_ban(
             reason=reason,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("unban"))
@@ -1741,10 +2158,15 @@ async def cmd_unban(
             moderator_id=message.from_user.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("kick"))
@@ -1764,7 +2186,9 @@ async def cmd_kick(
         )
         return
 
-    reason = (command.args or "").strip()
+    reason = (
+        command.args or ""
+    ).strip()
 
     async with AsyncSessionLocal() as session:
         result = await moderate_kick(
@@ -1776,10 +2200,15 @@ async def cmd_kick(
             reason=reason,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("purge"))
@@ -1790,7 +2219,9 @@ async def cmd_purge(
     if not message.from_user:
         return
 
-    amount = parse_integer(command.args)
+    amount = parse_integer(
+        command.args
+    )
 
     if amount is None:
         amount = 10
@@ -1809,7 +2240,10 @@ async def cmd_purge(
         count=amount,
     )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("setnick"))
@@ -1820,12 +2254,16 @@ async def cmd_setnick(
     if not message.from_user:
         return
 
-    args = (command.args or "").strip()
+    args = (
+        command.args or ""
+    ).strip()
 
     target_id = reply_target_id(message)
 
     if target_id is None:
-        parts = args.split(maxsplit=1)
+        parts = args.split(
+            maxsplit=1
+        )
 
         if not parts:
             await reply(
@@ -1838,9 +2276,14 @@ async def cmd_setnick(
             )
             return
 
-        parsed_target = parse_integer(parts[0])
+        parsed_target = parse_integer(
+            parts[0]
+        )
 
-        if parsed_target is not None and len(parts) == 2:
+        if (
+            parsed_target is not None
+            and len(parts) == 2
+        ):
             target_id = parsed_target
             nick = parts[1]
         else:
@@ -1878,10 +2321,15 @@ async def cmd_setnick(
             nick=nick,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 # ============================================================================
@@ -1899,10 +2347,14 @@ async def cmd_setrole(
 
     target_id = reply_target_id(message)
 
-    args = (command.args or "").split()
+    args = (
+        command.args or ""
+    ).split()
 
     if target_id is None and args:
-        target_id = parse_integer(args[0])
+        target_id = parse_integer(
+            args[0]
+        )
         args = args[1:]
 
     if target_id is None or not args:
@@ -1928,30 +2380,43 @@ async def cmd_setrole(
             role=role,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("delrole"))
-async def cmd_delrole(message: Message) -> None:
+async def cmd_delrole(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
     target_id = reply_target_id(message)
 
     if target_id is None:
-        target_id = parse_integer(
-            (message.text or "").split(maxsplit=1)[1]
-            if len((message.text or "").split()) > 1
-            else ""
-        )
+        parts = (
+            message.text or ""
+        ).split()
+
+        if len(parts) > 1:
+            target_id = parse_integer(
+                parts[1]
+            )
 
     if target_id is None:
         await reply(
             message,
-            "Используй /delrole ответом или укажи USER_ID.",
+            (
+                "Используй /delrole ответом "
+                "или укажи USER_ID."
+            ),
         )
         return
 
@@ -1963,10 +2428,15 @@ async def cmd_delrole(message: Message) -> None:
             target_id=target_id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("setperm"))
@@ -1977,7 +2447,9 @@ async def cmd_setperm(
     if not message.from_user:
         return
 
-    args = (command.args or "").split()
+    args = (
+        command.args or ""
+    ).split()
 
     if len(args) != 2:
         await reply(
@@ -2002,10 +2474,15 @@ async def cmd_setperm(
             scope=scope,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 # ============================================================================
@@ -2021,7 +2498,9 @@ async def cmd_give(
     if not message.from_user:
         return
 
-    args = (command.args or "").split()
+    args = (
+        command.args or ""
+    ).split()
 
     if len(args) != 2:
         await reply(
@@ -2033,7 +2512,11 @@ async def cmd_give(
     target_id = parse_integer(args[0])
     amount = parse_integer(args[1])
 
-    if target_id is None or amount is None or amount <= 0:
+    if (
+        target_id is None
+        or amount is None
+        or amount <= 0
+    ):
         await reply(
             message,
             "❌ Некорректные параметры.",
@@ -2049,10 +2532,15 @@ async def cmd_give(
             amount=amount,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("take"))
@@ -2063,7 +2551,9 @@ async def cmd_take(
     if not message.from_user:
         return
 
-    args = (command.args or "").split()
+    args = (
+        command.args or ""
+    ).split()
 
     if len(args) != 2:
         await reply(
@@ -2075,7 +2565,11 @@ async def cmd_take(
     target_id = parse_integer(args[0])
     amount = parse_integer(args[1])
 
-    if target_id is None or amount is None or amount <= 0:
+    if (
+        target_id is None
+        or amount is None
+        or amount <= 0
+    ):
         await reply(
             message,
             "❌ Некорректные параметры.",
@@ -2091,10 +2585,15 @@ async def cmd_take(
             amount=amount,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("setbalance"))
@@ -2105,19 +2604,28 @@ async def cmd_setbalance(
     if not message.from_user:
         return
 
-    args = (command.args or "").split()
+    args = (
+        command.args or ""
+    ).split()
 
     if len(args) != 2:
         await reply(
             message,
-            "Пример: <code>/setbalance 123456789 5000</code>",
+            (
+                "Пример: "
+                "<code>/setbalance 123456789 5000</code>"
+            ),
         )
         return
 
     target_id = parse_integer(args[0])
     amount = parse_integer(args[1])
 
-    if target_id is None or amount is None or amount < 0:
+    if (
+        target_id is None
+        or amount is None
+        or amount < 0
+    ):
         await reply(
             message,
             "❌ Некорректные параметры.",
@@ -2133,10 +2641,15 @@ async def cmd_setbalance(
             amount=amount,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("setlevel"))
@@ -2147,19 +2660,28 @@ async def cmd_setlevel(
     if not message.from_user:
         return
 
-    args = (command.args or "").split()
+    args = (
+        command.args or ""
+    ).split()
 
     if len(args) != 2:
         await reply(
             message,
-            "Пример: <code>/setlevel 123456789 10</code>",
+            (
+                "Пример: "
+                "<code>/setlevel 123456789 10</code>"
+            ),
         )
         return
 
     target_id = parse_integer(args[0])
     level = parse_integer(args[1])
 
-    if target_id is None or level is None or level < 1:
+    if (
+        target_id is None
+        or level is None
+        or level < 1
+    ):
         await reply(
             message,
             "❌ Некорректные параметры.",
@@ -2175,10 +2697,15 @@ async def cmd_setlevel(
             level=level,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 # ============================================================================
@@ -2186,13 +2713,29 @@ async def cmd_setlevel(
 # ============================================================================
 
 
-@router.callback_query(F.data.startswith("case:"))
-async def callback_case(callback: CallbackQuery) -> None:
-    if not callback.message or not callback.from_user:
+@router.callback_query(
+    F.data.startswith("case:")
+)
+async def callback_case(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
         await callback.answer()
         return
 
-    case_code = callback.data.split(":", 1)[1]
+    case_code = (
+        callback.data or ""
+    ).split(":", 1)[1]
+
+    if case_code not in CASE_REWARDS:
+        await callback.answer(
+            "Неизвестный кейс.",
+            show_alert=True,
+        )
+        return
 
     async with AsyncSessionLocal() as session:
         result = await open_case(
@@ -2202,15 +2745,34 @@ async def callback_case(callback: CallbackQuery) -> None:
             case_code=case_code,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
+
+        inventory_text = await format_inventory(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
+        keyboard = await build_case_keyboard(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
 
     await callback.answer(
         result.answer or result.message,
         show_alert=result.show_alert,
     )
 
-    if callback.message:
+    try:
+        await callback.message.edit_text(
+            inventory_text,
+            reply_markup=keyboard,
+        )
+    except TelegramBadRequest:
         await reply(
             callback.message,
             result.message,
@@ -2230,7 +2792,11 @@ async def cmd_giveaway(
     if not message.from_user:
         return
 
-    args = (command.args or "").split(maxsplit=3)
+    args = (
+        command.args or ""
+    ).split(
+        maxsplit=3
+    )
 
     if len(args) < 3:
         await reply(
@@ -2248,7 +2814,9 @@ async def cmd_giveaway(
     prize_type = args[0].lower()
 
     try:
-        duration_minutes = int(args[-1])
+        duration_minutes = int(
+            args[-1]
+        )
     except ValueError:
         await reply(
             message,
@@ -2268,12 +2836,20 @@ async def cmd_giveaway(
     prize_description = None
 
     if prize_type == "peanuts":
-        prize_amount = parse_integer(args[1])
+        prize_amount = parse_integer(
+            args[1]
+        )
 
-        if prize_amount is None or prize_amount <= 0:
+        if (
+            prize_amount is None
+            or prize_amount <= 0
+        ):
             await reply(
                 message,
-                "❌ Укажи положительное количество арахиса.",
+                (
+                    "❌ Укажи положительное "
+                    "количество арахиса."
+                ),
             )
             return
 
@@ -2329,8 +2905,10 @@ async def cmd_giveaway(
             prize_description=prize_description,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
     await reply(
         message,
@@ -2345,15 +2923,24 @@ async def cmd_giveaway(
 async def callback_giveaway_join(
     callback: CallbackQuery,
 ) -> None:
-    if not callback.message or not callback.from_user:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
         await callback.answer()
         return
 
-    try:
-        giveaway_id = int(
-            (callback.data or "").split(":")[2]
-        )
-    except (ValueError, IndexError):
+    parts = (
+        callback.data or ""
+    ).split(":")
+
+    giveaway_id = (
+        parse_integer(parts[2])
+        if len(parts) == 3
+        else None
+    )
+
+    if giveaway_id is None:
         await callback.answer(
             "Некорректный розыгрыш.",
             show_alert=True,
@@ -2368,8 +2955,10 @@ async def callback_giveaway_join(
             user_id=callback.from_user.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
     await callback.answer(
         result.answer or result.message,
@@ -2385,7 +2974,9 @@ async def cmd_giveaway_join(
     if not message.from_user:
         return
 
-    giveaway_id = parse_integer(command.args)
+    giveaway_id = parse_integer(
+        command.args
+    )
 
     if giveaway_id is None:
         await reply(
@@ -2402,10 +2993,15 @@ async def cmd_giveaway_join(
             user_id=message.from_user.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 @router.message(Command("giveaway_finish"))
@@ -2416,7 +3012,9 @@ async def cmd_giveaway_finish(
     if not message.from_user:
         return
 
-    giveaway_id = parse_integer(command.args)
+    giveaway_id = parse_integer(
+        command.args
+    )
 
     if giveaway_id is None:
         await reply(
@@ -2443,12 +3041,18 @@ async def cmd_giveaway_finish(
         result = await finish_giveaway(
             session=session,
             giveaway_id=giveaway_id,
+            chat_id=message.chat.id,
         )
 
-        if result.success:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
-    await reply(message, result.message)
+    await reply(
+        message,
+        result.message,
+    )
 
 
 # ============================================================================
@@ -2457,7 +3061,9 @@ async def cmd_giveaway_finish(
 
 
 @router.message(F.text)
-async def ordinary_message(message: Message) -> None:
+async def ordinary_message(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -2467,18 +3073,23 @@ async def ordinary_message(message: Message) -> None:
     if not is_group(message):
         return
 
-    text = (message.text or "").strip()
+    text = (
+        message.text or ""
+    ).strip()
 
     if not text:
         return
 
-    result = await execute_rp(message)
+    result = await execute_rp(
+        message
+    )
 
     if result is not None:
-        await reply(
-            message,
-            result.message,
-        )
+        if result.message:
+            await reply(
+                message,
+                result.message,
+            )
         return
 
     async with AsyncSessionLocal() as session:
@@ -2487,8 +3098,10 @@ async def ordinary_message(message: Message) -> None:
             message=message,
         )
 
-        if result.changed:
-            await session.commit()
+        await commit_result(
+            session,
+            result,
+        )
 
     if result.level_up_message:
         await reply(
@@ -2503,7 +3116,9 @@ async def ordinary_message(message: Message) -> None:
 
 
 @router.errors()
-async def global_error_handler(event) -> None:
+async def global_error_handler(
+    event,
+) -> None:
     logger.exception(
         "Необработанная ошибка Telegram handler: %s",
         event.exception,
@@ -2515,8 +3130,12 @@ async def global_error_handler(event) -> None:
 # ============================================================================
 
 
-def register_handlers(dispatcher) -> None:
-    dispatcher.include_router(router)
+def register_handlers(
+    dispatcher,
+) -> None:
+    dispatcher.include_router(
+        router
+    )
 
     logger.info(
         "Основной router зарегистрирован."
