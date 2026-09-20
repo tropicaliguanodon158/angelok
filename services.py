@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core import (
@@ -191,6 +191,7 @@ GAME_FEATURES = {
 }
 
 _BALANCE_LOCK = asyncio.Lock()
+_BATTLE_PASS_LOCK = asyncio.Lock()
 _TTT_LOCK = asyncio.Lock()
 _CASE_LOCK = asyncio.Lock()
 _GIVEAWAY_LOCK = asyncio.Lock()
@@ -358,22 +359,48 @@ async def _change_balance_unlocked(
             user_id,
         )
 
-    new_balance = member.balance + amount
+    now = utcnow()
 
-    if new_balance < 0:
-        raise ValueError(
-            "Баланс не может стать отрицательным."
+    conditions = [
+        ChatMember.chat_id == chat_id,
+        ChatMember.user_id == user_id,
+    ]
+
+    if amount < 0:
+        conditions.append(
+            ChatMember.balance + amount >= 0
         )
 
-    member.balance = new_balance
-    member.updated_at = utcnow()
+    statement = (
+        update(ChatMember)
+        .where(*conditions)
+        .values(
+            balance=ChatMember.balance + amount,
+            updated_at=now,
+        )
+    )
+
+    result = await session.execute(statement)
+
+    if result.rowcount != 1:
+        raise ValueError(
+            "Недостаточно арахиса."
+        )
+
+    await session.refresh(
+        member,
+        attribute_names=[
+            "balance",
+            "updated_at",
+        ],
+    )
 
     await add_transaction(
         session=session,
         chat_id=chat_id,
         user_id=user_id,
         amount=amount,
-        balance_after=new_balance,
+        balance_after=member.balance,
         transaction_type=transaction_type,
         description=description,
     )
@@ -912,98 +939,99 @@ async def _process_battle_pass(
     session: AsyncSession,
     member: ChatMember,
 ) -> list[str]:
-    old_level = member.battle_pass_level
+    async with _BATTLE_PASS_LOCK:
+        old_level = member.battle_pass_level
 
-    member.battle_pass_xp += 1
+        member.battle_pass_xp += 1
 
-    new_level = min(
-        BP_MAX_LEVEL,
-        1 + member.battle_pass_xp // BP_XP_PER_LEVEL,
-    )
-
-    if new_level <= old_level:
-        return []
-
-    member.battle_pass_level = new_level
-
-    messages: list[str] = []
-
-    for level in range(
-        old_level + 1,
-        new_level + 1,
-    ):
-        reward = BATTLE_PASS_REWARDS.get(level)
-
-        if reward is None:
-            continue
-
-        existing = await session.execute(
-            select(BattlePassRewardClaim).where(
-                BattlePassRewardClaim.chat_id == member.chat_id,
-                BattlePassRewardClaim.user_id == member.user_id,
-                BattlePassRewardClaim.season == member.battle_pass_season,
-                BattlePassRewardClaim.level == level,
-            )
+        new_level = min(
+            BP_MAX_LEVEL,
+            1 + member.battle_pass_xp // BP_XP_PER_LEVEL,
         )
 
-        if existing.scalar_one_or_none():
-            continue
+        if new_level <= old_level:
+            return []
 
-        session.add(
-            BattlePassRewardClaim(
-                chat_id=member.chat_id,
-                user_id=member.user_id,
-                season=member.battle_pass_season,
-                level=level,
-                reward_code=str(
-                    reward.item_code
-                    or reward.tag_code
-                    or reward.reward_type
-                ),
-            )
-        )
+        member.battle_pass_level = new_level
 
-        if reward.reward_type == "peanuts":
-            await change_balance(
-                session,
-                member.chat_id,
-                member.user_id,
-                reward.amount,
-                "battle_pass_reward",
-                f"Battle Pass уровень {level}",
+        messages: list[str] = []
+
+        for level in range(
+            old_level + 1,
+            new_level + 1,
+        ):
+            reward = BATTLE_PASS_REWARDS.get(level)
+
+            if reward is None:
+                continue
+
+            existing = await session.execute(
+                select(BattlePassRewardClaim).where(
+                    BattlePassRewardClaim.chat_id == member.chat_id,
+                    BattlePassRewardClaim.user_id == member.user_id,
+                    BattlePassRewardClaim.season == member.battle_pass_season,
+                    BattlePassRewardClaim.level == level,
+                )
             )
 
-        elif reward.reward_type == "xp":
-            member.xp += reward.amount
-            member.level = level_from_xp(
-                member.xp
+            if existing.scalar_one_or_none():
+                continue
+
+            session.add(
+                BattlePassRewardClaim(
+                    chat_id=member.chat_id,
+                    user_id=member.user_id,
+                    season=member.battle_pass_season,
+                    level=level,
+                    reward_code=str(
+                        reward.item_code
+                        or reward.tag_code
+                        or reward.reward_type
+                    ),
+                )
             )
 
-        elif reward.reward_type == "case":
-            if reward.item_code:
-                await grant_item(
+            if reward.reward_type == "peanuts":
+                await change_balance(
                     session,
                     member.chat_id,
                     member.user_id,
-                    reward.item_code,
+                    reward.amount,
+                    "battle_pass_reward",
+                    f"Battle Pass уровень {level}",
                 )
 
-        elif reward.reward_type == "tag":
-            if reward.tag_code:
-                await grant_tag(
-                    session,
-                    member.chat_id,
-                    member.user_id,
-                    reward.tag_code,
-                    f"battle_pass:{level}",
+            elif reward.reward_type == "xp":
+                member.xp += reward.amount
+                member.level = level_from_xp(
+                    member.xp
                 )
 
-        messages.append(
-            f"• {level} — "
-            f"{escape(reward.description)}"
-        )
+            elif reward.reward_type == "case":
+                if reward.item_code:
+                    await grant_item(
+                        session,
+                        member.chat_id,
+                        member.user_id,
+                        reward.item_code,
+                    )
 
-    return messages
+            elif reward.reward_type == "tag":
+                if reward.tag_code:
+                    await grant_tag(
+                        session,
+                        member.chat_id,
+                        member.user_id,
+                        reward.tag_code,
+                        f"battle_pass:{level}",
+                    )
+
+            messages.append(
+                f"• {level} — "
+                f"{escape(reward.description)}"
+            )
+
+        return messages
 
 
 async def handle_message(
@@ -1570,36 +1598,78 @@ async def claim_daily_bonus(
         member,
     )
 
-    if member.last_bonus_at is not None:
-        elapsed = (
-            utcnow() - member.last_bonus_at
-        ).total_seconds()
+    now = utcnow()
+    cutoff = now - timedelta(
+        days=1,
+    )
 
-        if elapsed < 24 * 60 * 60:
+    async with _BALANCE_LOCK:
+        statement = (
+            update(ChatMember)
+            .where(
+                ChatMember.chat_id == chat_id,
+                ChatMember.user_id == user_id,
+                or_(
+                    ChatMember.last_bonus_at.is_(None),
+                    ChatMember.last_bonus_at <= cutoff,
+                ),
+            )
+            .values(
+                last_bonus_at=now,
+                updated_at=now,
+            )
+        )
+
+        result = await session.execute(statement)
+
+        if result.rowcount != 1:
+            current = await get_member(
+                session,
+                chat_id,
+                user_id,
+            )
+
+            remaining = 0
+
+            if (
+                current is not None
+                and current.last_bonus_at is not None
+            ):
+                remaining = max(
+                    0,
+                    int(
+                        (
+                            24 * 60 * 60
+                            - (
+                                now
+                                - current.last_bonus_at
+                            ).total_seconds()
+                        )
+                    ),
+                )
+
             return ServiceResult(
                 False,
                 (
                     "⏳ Бонус уже получен.\n"
                     f"Следующий через "
-                    f"<b>{format_seconds(int(24 * 60 * 60 - elapsed))}</b>."
+                    f"<b>{format_seconds(remaining)}</b>."
                 ),
             )
 
-    amount = RNG.randint(
-        config.daily_bonus_min,
-        config.daily_bonus_max,
-    )
+        amount = RNG.randint(
+            config.daily_bonus_min,
+            config.daily_bonus_max,
+        )
 
-    await change_balance(
-        session,
-        chat_id,
-        user_id,
-        amount,
-        "daily_bonus",
-        "Ежедневный бонус",
-    )
-
-    member.last_bonus_at = utcnow()
+        await _change_balance_unlocked(
+            session,
+            chat_id,
+            user_id,
+            amount,
+            "daily_bonus",
+            "Ежедневный бонус",
+        )
 
     return ServiceResult(
         True,
@@ -1809,72 +1879,71 @@ async def finish_game(
     result: str,
     multiplier: float,
     won: bool,
-) -> int:
+) -> Optional[int]:
     payout = (
         int(bet * multiplier)
         if won
         else 0
     )
 
-    await change_balance(
-        session,
-        chat_id,
-        user_id,
-        -bet,
-        "game_bet",
-        f"Ставка: {game_type}",
-    )
+    async with _BALANCE_LOCK:
+        try:
+            await _change_balance_unlocked(
+                session,
+                chat_id,
+                user_id,
+                -bet,
+                "game_bet",
+                f"Ставка: {game_type}",
+            )
+        except ValueError:
+            return None
 
-    if payout:
-        await change_balance(
+        if payout:
+            await _change_balance_unlocked(
+                session,
+                chat_id,
+                user_id,
+                payout,
+                "game_payout",
+                f"Выигрыш: {game_type}",
+            )
+
+        member = await get_member(
             session,
             chat_id,
             user_id,
-            payout,
-            "game_payout",
-            f"Выигрыш: {game_type}",
         )
 
-    member = await get_member(
-        session,
-        chat_id,
-        user_id,
-    )
+        if member:
+            member.games_played += 1
 
-    if member:
-        await reconcile_member_state(
-            session,
-            member,
-        )
+            if won:
+                member.games_won += 1
+                member.total_won += max(
+                    0,
+                    payout - bet,
+                )
+            else:
+                member.games_lost += 1
+                member.total_lost += bet
 
-        member.games_played += 1
-
-        if won:
-            member.games_won += 1
-            member.total_won += max(
-                0,
-                payout - bet,
+        session.add(
+            Game(
+                chat_id=chat_id,
+                user_id=user_id,
+                game_type=game_type,
+                bet=bet,
+                result=result,
+                multiplier=multiplier,
+                payout=payout,
+                won=won,
+                status="finished",
+                finished_at=utcnow(),
             )
-        else:
-            member.games_lost += 1
-            member.total_lost += bet
-
-    session.add(
-        Game(
-            chat_id=chat_id,
-            user_id=user_id,
-            game_type=game_type,
-            bet=bet,
-            result=result,
-            multiplier=multiplier,
-            payout=payout,
-            won=won,
-            status="finished",
-            finished_at=utcnow(),
         )
-    )
 
-    await session.flush()
+        await session.flush()
 
     return payout
 
@@ -1915,6 +1984,14 @@ async def play_coinflip(
         1.95 if won else 0,
         won,
     )
+
+    if payout is None:
+        return ServiceResult(
+            False,
+            "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     return ServiceResult(
         True,
@@ -1971,6 +2048,14 @@ async def play_dice(
         1.8 if won else 0,
         won,
     )
+
+    if payout is None:
+        return ServiceResult(
+            False,
+            "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     return ServiceResult(
         True,
@@ -2053,6 +2138,14 @@ async def play_slots(
         won,
     )
 
+    if payout is None:
+        return ServiceResult(
+            False,
+            "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
+
     return ServiceResult(
         True,
         (
@@ -2077,17 +2170,6 @@ async def play_roulette(
     bet: int,
     choice: str,
 ) -> ServiceResult:
-    _, error = await prepare_game(
-        session,
-        chat_id,
-        user_id,
-        "roulette",
-        bet,
-    )
-
-    if error:
-        return error
-
     choice = choice.lower()
 
     if choice not in {
@@ -2099,6 +2181,17 @@ async def play_roulette(
             False,
             "❌ Выбор: red, black или green.",
         )
+
+    _, error = await prepare_game(
+        session,
+        chat_id,
+        user_id,
+        "roulette",
+        bet,
+    )
+
+    if error:
+        return error
 
     number = RNG.randint(
         0,
@@ -2141,6 +2234,14 @@ async def play_roulette(
         multiplier,
         won,
     )
+
+    if payout is None:
+        return ServiceResult(
+            False,
+            "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     emoji = {
         "red": "🔴",
@@ -2206,6 +2307,14 @@ async def play_guess(
         won,
     )
 
+    if payout is None:
+        return ServiceResult(
+            False,
+            "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
+
     return ServiceResult(
         True,
         (
@@ -2264,6 +2373,14 @@ async def play_football(
         won,
     )
 
+    if payout is None:
+        return ServiceResult(
+            False,
+            "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
+
     return ServiceResult(
         True,
         (
@@ -2317,6 +2434,14 @@ async def play_basketball(
         BASKETBALL_MULTIPLIER if won else 0,
         won,
     )
+
+    if payout is None:
+        return ServiceResult(
+            False,
+            "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     return ServiceResult(
         True,
@@ -2515,23 +2640,31 @@ async def play_blackjack(
         won = False
 
     if draw and BLACKJACK_DRAW_REFUND:
-        await change_balance(
-            session,
-            chat_id,
-            user_id,
-            -bet,
-            "game_bet",
-            "Ставка: blackjack",
-        )
+        try:
+            await _change_balance_unlocked(
+                session,
+                chat_id,
+                user_id,
+                -bet,
+                "game_bet",
+                "Ставка: blackjack",
+            )
 
-        await change_balance(
-            session,
-            chat_id,
-            user_id,
-            bet,
-            "game_payout",
-            "Возврат ставки: blackjack",
-        )
+            await _change_balance_unlocked(
+                session,
+                chat_id,
+                user_id,
+                bet,
+                "game_payout",
+                "Возврат ставки: blackjack",
+            )
+        except ValueError:
+            return ServiceResult(
+                False,
+                "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+                answer="Баланс изменился. Попробуй ещё раз.",
+                show_alert=True,
+            )
 
         member = await get_member(
             session,
@@ -2540,11 +2673,6 @@ async def play_blackjack(
         )
 
         if member:
-            await reconcile_member_state(
-                session,
-                member,
-            )
-
             member.games_played += 1
 
         session.add(
@@ -2596,6 +2724,14 @@ async def play_blackjack(
         multiplier,
         won,
     )
+
+    if payout is None:
+        return ServiceResult(
+            False,
+            "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     return ServiceResult(
         True,
@@ -2715,6 +2851,14 @@ async def play_crash(
         cashout_multiplier if won else 0.0,
         won,
     )
+
+    if payout is None:
+        return ServiceResult(
+            False,
+            "❌ Не удалось завершить игру: баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     if won:
         result_text = (
@@ -3453,14 +3597,22 @@ async def perform_rp(
             error,
         )
 
-    await change_balance(
-        session,
-        chat_id,
-        actor_id,
-        -NORMAL_RP_COST,
-        "rp",
-        f"Обычный RP: {key}",
-    )
+    try:
+        await change_balance(
+            session,
+            chat_id,
+            actor_id,
+            -NORMAL_RP_COST,
+            "rp",
+            f"Обычный RP: {key}",
+        )
+    except ValueError:
+        return ServiceResult(
+            False,
+            "❌ Баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     actor = await session.get(
         User,
@@ -3628,14 +3780,22 @@ async def perform_adult_rp(
             error,
         )
 
-    await change_balance(
-        session,
-        chat_id,
-        actor_id,
-        -ADULT_RP_COST,
-        "adult_rp",
-        f"18+ RP: {adult_action.key}",
-    )
+    try:
+        await change_balance(
+            session,
+            chat_id,
+            actor_id,
+            -ADULT_RP_COST,
+            "adult_rp",
+            f"18+ RP: {adult_action.key}",
+        )
+    except ValueError:
+        return ServiceResult(
+            False,
+            "❌ Баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     actor_gain = (
         RNG.uniform(
@@ -4057,23 +4217,32 @@ async def rob_user(
         target.balance,
     )
 
-    await change_balance(
-        session,
-        chat_id,
-        target.user_id,
-        -amount,
-        "rob_loss",
-        f"Ограбление пользователем {actor_id}",
-    )
+    try:
+        async with _BALANCE_LOCK:
+            await _change_balance_unlocked(
+                session,
+                chat_id,
+                target.user_id,
+                -amount,
+                "rob_loss",
+                f"Ограбление пользователем {actor_id}",
+            )
 
-    await change_balance(
-        session,
-        chat_id,
-        actor_id,
-        amount,
-        "rob_reward",
-        f"Ограбление пользователя {target_id}",
-    )
+            await _change_balance_unlocked(
+                session,
+                chat_id,
+                actor_id,
+                amount,
+                "rob_reward",
+                f"Ограбление пользователя {target_id}",
+            )
+    except ValueError:
+        return ServiceResult(
+            False,
+            "❌ Баланс цели изменился. Попробуй ещё раз.",
+            answer="Баланс цели изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     return ServiceResult(
         True,
@@ -4182,14 +4351,22 @@ async def use_medicine(
             error,
         )
 
-    await change_balance(
-        session,
-        chat_id,
-        user_id,
-        -DISEASE_MEDICINE_COST,
-        "medicine",
-        "Лекарство",
-    )
+    try:
+        await change_balance(
+            session,
+            chat_id,
+            user_id,
+            -DISEASE_MEDICINE_COST,
+            "medicine",
+            "Лекарство",
+        )
+    except ValueError:
+        return ServiceResult(
+            False,
+            "❌ Баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     member.has_disease = False
     member.disease_since = None
@@ -4245,14 +4422,22 @@ async def visit_venereologist(
             error,
         )
 
-    await change_balance(
-        session,
-        chat_id,
-        user_id,
-        -VENEREOLOGIST_COST,
-        "venereologist",
-        "Венеролог",
-    )
+    try:
+        await change_balance(
+            session,
+            chat_id,
+            user_id,
+            -VENEREOLOGIST_COST,
+            "venereologist",
+            "Венеролог",
+        )
+    except ValueError:
+        return ServiceResult(
+            False,
+            "❌ Баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     if RNG.random() < VENEREOLOGIST_CURE_CHANCE:
         member.has_disease = False
@@ -4430,14 +4615,22 @@ async def abort_child(
             error,
         )
 
-    await change_balance(
-        session,
-        chat_id,
-        user_id,
-        -ABORT_COST_VALUE,
-        "abort",
-        "Игровой аборт",
-    )
+    try:
+        await change_balance(
+            session,
+            chat_id,
+            user_id,
+            -ABORT_COST_VALUE,
+            "abort",
+            "Игровой аборт",
+        )
+    except ValueError:
+        return ServiceResult(
+            False,
+            "❌ Баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     if RNG.random() >= ABORT_SUCCESS_CHANCE:
         return ServiceResult(
@@ -5264,14 +5457,22 @@ async def admin_take_money(
             error,
         )
 
-    await change_balance(
-        session,
-        chat_id,
-        target_user_id,
-        -amount,
-        "admin_take",
-        f"Забрано owner {owner_id}",
-    )
+    try:
+        await change_balance(
+            session,
+            chat_id,
+            target_user_id,
+            -amount,
+            "admin_take",
+            f"Забрано owner {owner_id}",
+        )
+    except ValueError:
+        return ServiceResult(
+            False,
+            "❌ Баланс изменился. Попробуй ещё раз.",
+            answer="Баланс изменился. Попробуй ещё раз.",
+            show_alert=True,
+        )
 
     return ServiceResult(
         True,
