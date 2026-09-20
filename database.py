@@ -922,7 +922,6 @@ class ModPermission(Base):
         nullable=False,
     )
 
-    # Совместимость со старой версией services.py.
     scope = synonym("required_role")
 
     updated_by: Mapped[Optional[int]] = mapped_column(
@@ -1354,7 +1353,6 @@ class Giveaway(Base):
         nullable=True,
     )
 
-    # Совместимость со старой версией services.py.
     prize_description = synonym("prize_external")
 
     winners_count: Mapped[int] = mapped_column(
@@ -1379,7 +1377,6 @@ class Giveaway(Base):
         nullable=True,
     )
 
-    # Совместимость со старой версией services.py.
     winner_id = synonym("winner_user_id")
 
     created_at: Mapped[datetime] = mapped_column(
@@ -1393,7 +1390,6 @@ class Giveaway(Base):
         nullable=True,
     )
 
-    # Совместимость со старой версией services.py.
     completed_at = synonym("finished_at")
 
 
@@ -2250,9 +2246,7 @@ async def run_migrations(connection) -> None:
     )
 
     if participants_exists:
-        chat_definition = (
-            "BIGINT"
-        )
+        chat_definition = "BIGINT"
 
         await _add_column_if_missing(
             connection,
@@ -2261,7 +2255,6 @@ async def run_migrations(connection) -> None:
             chat_definition,
         )
 
-        # Старые записи получают chat_id из связанного giveaway.
         if giveaways_exists:
             await connection.execute(
                 text(
@@ -2307,20 +2300,12 @@ async def run_migrations(connection) -> None:
     )
 
     if permissions_exists:
-        if dialect == "sqlite":
-            await _add_column_if_missing(
-                connection,
-                "mod_permissions",
-                "required_role",
-                "VARCHAR(32) DEFAULT 'staff' NOT NULL",
-            )
-        else:
-            await _add_column_if_missing(
-                connection,
-                "mod_permissions",
-                "required_role",
-                "VARCHAR(32) DEFAULT 'staff' NOT NULL",
-            )
+        await _add_column_if_missing(
+            connection,
+            "mod_permissions",
+            "required_role",
+            "VARCHAR(32) DEFAULT 'staff' NOT NULL",
+        )
 
         columns = await _column_names(
             connection,
@@ -2422,13 +2407,189 @@ async def run_migrations(connection) -> None:
 
 
 # ============================================================================
+# STATIC DATA
+# ============================================================================
+
+
+STATIC_INVENTORY_ITEMS = (
+    {
+        "code": "basic_case",
+        "name": "Обычный кейс",
+        "description": "Обычный игровой кейс.",
+        "item_type": "case",
+        "max_quantity": None,
+        "stackable": True,
+        "one_use": True,
+    },
+    {
+        "code": "rare_case",
+        "name": "Редкий кейс",
+        "description": "Редкий игровой кейс.",
+        "item_type": "case",
+        "max_quantity": None,
+        "stackable": True,
+        "one_use": True,
+    },
+    {
+        "code": "epic_case",
+        "name": "Эпический кейс",
+        "description": "Эпический игровой кейс.",
+        "item_type": "case",
+        "max_quantity": None,
+        "stackable": True,
+        "one_use": True,
+    },
+    {
+        "code": "legendary_case",
+        "name": "Легендарный кейс",
+        "description": "Легендарный игровой кейс.",
+        "item_type": "case",
+        "max_quantity": None,
+        "stackable": True,
+        "one_use": True,
+    },
+    {
+        "code": "condom",
+        "name": "Презерватив",
+        "description": "Одноразовый предмет. Снижает риск болезни и беременности.",
+        "item_type": "item",
+        "max_quantity": None,
+        "stackable": True,
+        "one_use": True,
+    },
+    {
+        "code": "lubricant",
+        "name": "Лубрикант",
+        "description": "Одноразовый бонус к росту при 18+ RP.",
+        "item_type": "item",
+        "max_quantity": None,
+        "stackable": True,
+        "one_use": True,
+    },
+    {
+        "code": "dildo",
+        "name": "Dildo",
+        "description": "Даёт несколько дополнительных использований мастурбации.",
+        "item_type": "item",
+        "max_quantity": 1,
+        "stackable": False,
+        "one_use": True,
+    },
+    {
+        "code": "rubber_pussy",
+        "name": "Rubber Pussy",
+        "description": "Снижает cooldown мастурбации и 18+ RP и даёт ежедневный шанс роста.",
+        "item_type": "item",
+        "max_quantity": 1,
+        "stackable": False,
+        "one_use": False,
+    },
+    {
+        "code": "silicone_implant",
+        "name": "Силиконовый имплант",
+        "description": "Одноразовый предмет, который автоматически увеличивает размер.",
+        "item_type": "item",
+        "max_quantity": None,
+        "stackable": False,
+        "one_use": True,
+    },
+)
+
+STATIC_TAGS = (
+    {
+        "code": "living_legend",
+        "name": "ЖИВАЯ ЛЕГЕНДА",
+        "description": "Финальный тег Battle Pass.",
+    },
+)
+
+
+async def seed_static_data(
+    session: AsyncSession,
+) -> None:
+    for item_data in STATIC_INVENTORY_ITEMS:
+        result = await session.execute(
+            select(InventoryItem).where(
+                InventoryItem.code == item_data["code"],
+            )
+        )
+
+        item = result.scalar_one_or_none()
+
+        if item is None:
+            session.add(
+                InventoryItem(
+                    code=item_data["code"],
+                    name=item_data["name"],
+                    description=item_data["description"],
+                    item_type=item_data["item_type"],
+                    max_quantity=item_data["max_quantity"],
+                    stackable=item_data["stackable"],
+                    one_use=item_data["one_use"],
+                )
+            )
+            continue
+
+        changed = False
+
+        for field_name in (
+            "name",
+            "description",
+            "item_type",
+            "max_quantity",
+            "stackable",
+            "one_use",
+        ):
+            expected = item_data[field_name]
+
+            if getattr(item, field_name) != expected:
+                setattr(
+                    item,
+                    field_name,
+                    expected,
+                )
+                changed = True
+
+        if changed:
+            item.created_at = item.created_at or utcnow()
+
+    for tag_data in STATIC_TAGS:
+        result = await session.execute(
+            select(Tag).where(
+                Tag.code == tag_data["code"],
+            )
+        )
+
+        tag = result.scalar_one_or_none()
+
+        if tag is None:
+            session.add(
+                Tag(
+                    code=tag_data["code"],
+                    name=tag_data["name"],
+                    description=tag_data["description"],
+                )
+            )
+            continue
+
+        if tag.name != tag_data["name"]:
+            tag.name = tag_data["name"]
+
+        if tag.description != tag_data["description"]:
+            tag.description = tag_data["description"]
+
+    await session.flush()
+
+
+# ============================================================================
 # INITIALIZATION
 # ============================================================================
 
 
 async def initialize_database() -> None:
     """
-    Создаёт таблицы и выполняет совместимые миграции.
+    Создаёт таблицы, выполняет совместимые миграции
+    и гарантирует наличие статических предметов/тегов.
     """
 
     async with engine.begin() as connection:
@@ -2439,6 +2600,12 @@ async def initialize_database() -> None:
         await run_migrations(
             connection,
         )
+
+    async with AsyncSessionLocal() as session:
+        await seed_static_data(
+            session,
+        )
+        await session.commit()
 
 
 async def close_database() -> None:
@@ -2460,8 +2627,6 @@ async def delete_chat_data(
     Используется только административными процедурами.
     """
 
-    # Участники giveaway не имеют собственного chat_id в старых БД,
-    # поэтому удаляем их через giveaway_id.
     giveaway_ids_result = await session.execute(
         select(Giveaway.id).where(
             Giveaway.chat_id == chat_id,
