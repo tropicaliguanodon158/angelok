@@ -337,6 +337,52 @@ async def can_afford(
     return member, None
 
 
+async def _change_balance_unlocked(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+    amount: int,
+    transaction_type: str,
+    description: Optional[str] = None,
+) -> ChatMember:
+    member = await get_member(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    if member is None:
+        member = await ensure_member(
+            session,
+            chat_id,
+            user_id,
+        )
+
+    new_balance = member.balance + amount
+
+    if new_balance < 0:
+        raise ValueError(
+            "Баланс не может стать отрицательным."
+        )
+
+    member.balance = new_balance
+    member.updated_at = utcnow()
+
+    await add_transaction(
+        session=session,
+        chat_id=chat_id,
+        user_id=user_id,
+        amount=amount,
+        balance_after=new_balance,
+        transaction_type=transaction_type,
+        description=description,
+    )
+
+    await session.flush()
+
+    return member
+
+
 async def change_balance(
     session: AsyncSession,
     chat_id: int,
@@ -346,42 +392,14 @@ async def change_balance(
     description: Optional[str] = None,
 ) -> ChatMember:
     async with _BALANCE_LOCK:
-        member = await get_member(
-            session,
-            chat_id,
-            user_id,
-        )
-
-        if member is None:
-            member = await ensure_member(
-                session,
-                chat_id,
-                user_id,
-            )
-
-        new_balance = member.balance + amount
-
-        if new_balance < 0:
-            raise ValueError(
-                "Баланс не может стать отрицательным."
-            )
-
-        member.balance = new_balance
-        member.updated_at = utcnow()
-
-        await add_transaction(
+        return await _change_balance_unlocked(
             session=session,
             chat_id=chat_id,
             user_id=user_id,
             amount=amount,
-            balance_after=new_balance,
             transaction_type=transaction_type,
             description=description,
         )
-
-        await session.flush()
-
-        return member
 
 
 async def resolve_target(
@@ -1649,21 +1667,31 @@ async def transfer_money(
         receiver_member,
     )
 
-    _, error = await can_afford(
-        session,
-        chat_id,
-        sender_id,
-        amount,
-    )
-
-    if error:
-        return ServiceResult(
-            False,
-            error,
+    async with _BALANCE_LOCK:
+        sender_member = await get_member(
+            session,
+            chat_id,
+            sender_id,
         )
 
-    async with _BALANCE_LOCK:
-        await change_balance(
+        if sender_member is None:
+            sender_member = await ensure_member(
+                session,
+                chat_id,
+                sender_id,
+            )
+
+        if sender_member.balance < amount:
+            return ServiceResult(
+                False,
+                (
+                    "❌ Недостаточно арахиса.\n"
+                    f"Баланс: <b>{format_balance(sender_member.balance)}</b> 🥜\n"
+                    f"Нужно: <b>{format_balance(amount)}</b> 🥜"
+                ),
+            )
+
+        await _change_balance_unlocked(
             session,
             chat_id,
             sender_id,
@@ -1672,7 +1700,7 @@ async def transfer_money(
             f"Перевод пользователю {receiver_id}",
         )
 
-        await change_balance(
+        await _change_balance_unlocked(
             session,
             chat_id,
             receiver_id,
@@ -2868,19 +2896,37 @@ async def start_tictactoe(
             ),
         )
 
-    if member.balance < bet:
-        return ServiceResult(
-            False,
-            (
-                "❌ Недостаточно арахиса.\n"
-                f"Баланс: "
-                f"<b>{format_balance(member.balance)}</b> 🥜\n"
-                f"Нужно: "
-                f"<b>{format_balance(bet)}</b> 🥜"
-            ),
+    async with _TTT_LOCK:
+        member = await get_member(
+            session,
+            chat_id,
+            user_id,
         )
 
-    async with _TTT_LOCK:
+        if member is None:
+            member = await ensure_member(
+                session,
+                chat_id,
+                user_id,
+            )
+
+        await reconcile_member_state(
+            session,
+            member,
+        )
+
+        if member.balance < bet:
+            return ServiceResult(
+                False,
+                (
+                    "❌ Недостаточно арахиса.\n"
+                    f"Баланс: "
+                    f"<b>{format_balance(member.balance)}</b> 🥜\n"
+                    f"Нужно: "
+                    f"<b>{format_balance(bet)}</b> 🥜"
+                ),
+            )
+
         existing = await session.execute(
             select(TicTacToeGame).where(
                 TicTacToeGame.chat_id == chat_id,
@@ -2903,7 +2949,7 @@ async def start_tictactoe(
                     "❌ У тебя уже есть активная игра.",
                 )
 
-        await change_balance(
+        await _change_balance_unlocked(
             session,
             chat_id,
             user_id,
@@ -2984,21 +3030,6 @@ async def join_tictactoe(
                 show_alert=True,
             )
 
-        _, error = await can_afford(
-            session,
-            game.chat_id,
-            user_id,
-            game.bet,
-        )
-
-        if error:
-            return ServiceResult(
-                False,
-                error,
-                answer="Недостаточно арахиса.",
-                show_alert=True,
-            )
-
         target_member = await get_member(
             session,
             game.chat_id,
@@ -3017,13 +3048,27 @@ async def join_tictactoe(
             target_member,
         )
 
+        if target_member.balance < game.bet:
+            return ServiceResult(
+                False,
+                (
+                    "❌ Недостаточно арахиса.\n"
+                    f"Баланс: "
+                    f"<b>{format_balance(target_member.balance)}</b> 🥜\n"
+                    f"Нужно: "
+                    f"<b>{format_balance(game.bet)}</b> 🥜"
+                ),
+                answer="Недостаточно арахиса.",
+                show_alert=True,
+            )
+
         game.player_o_id = user_id
         game.current_player_id = (
             game.player_x_id
         )
         game.status = "playing"
 
-        await change_balance(
+        await _change_balance_unlocked(
             session,
             game.chat_id,
             user_id,
@@ -3150,6 +3195,32 @@ async def tictactoe_move(
                             "ttt_refund",
                             "Возврат при ничьей TTT",
                         )
+
+                player_x = await get_member(
+                    session,
+                    game.chat_id,
+                    game.player_x_id,
+                )
+
+                player_o = await get_member(
+                    session,
+                    game.chat_id,
+                    game.player_o_id,
+                ) if game.player_o_id else None
+
+                if player_x:
+                    await reconcile_member_state(
+                        session,
+                        player_x,
+                    )
+                    player_x.games_played += 1
+
+                if player_o:
+                    await reconcile_member_state(
+                        session,
+                        player_o,
+                    )
+                    player_o.games_played += 1
 
                 text = (
                     "⭕❌ <b>Ничья!</b>\n\n"
@@ -4722,7 +4793,6 @@ async def _moderation_action(
             moderator_id=moderator_id,
             action=action,
             reason=reason,
-            duration=duration,
         )
     )
 
