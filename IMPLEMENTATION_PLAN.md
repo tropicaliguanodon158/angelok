@@ -13,19 +13,25 @@
 * Сохранять SQLAlchemy 2.x + asyncio.
 * SQLite для локального запуска.
 * PostgreSQL для VDS.
-* Все игровые и RP-механики должны быть вынесены из `handlers.py`, насколько это возможно.
 * Telegram handlers отвечают за Telegram-взаимодействие.
 * Services отвечают за бизнес-логику.
 * Database отвечает за модели и работу с БД.
-* Конфигурационные значения должны находиться в `core.py`.
+* Конфигурационные значения находятся в `core.py`.
 * Не ломать существующие команды без причины.
-* Все новые механики должны переживать перезапуск бота.
-* Не использовать in-memory состояние там, где состояние должно сохраняться в БД.
+* Все persistent-механики должны переживать перезапуск бота.
+* Не использовать in-memory состояние там, где состояние должно храниться в БД.
 * Не использовать фоновые бесконечные задачи для механик, которые можно рассчитывать по timestamp при обращении пользователя.
+* `/purge` полностью исключён из проекта.
+* Message tracking полностью исключён из проекта.
+* Не добавлять отдельные таблицы или файлы для message tracking.
+* Не добавлять `purge` обратно в commands/help/permissions/handlers.
+* RP-сообщения не дают XP. XP начисляется обычным обработанным сообщениям.
 
 ---
 
-# 1. Итоговая структура
+# 1. Фактическая структура проекта
+
+Проект сознательно оставлен компактным.
 
 ```text
 angelok/
@@ -34,17 +40,23 @@ angelok/
 ├── database.py
 ├── services.py
 ├── handlers.py
-├── games.py
-├── rp.py
-├── inventory.py
-├── moderation.py
 ├── requirements.txt
 ├── .env.example
 ├── README.md
 └── IMPLEMENTATION_PLAN.md
 ```
 
-Основной лимит: **10 файлов**, включая `requirements.txt`.
+Всего: **9 основных файлов**.
+
+Новые `games.py`, `rp.py`, `inventory.py`, `moderation.py` не создаются.
+
+Их ответственность распределена между:
+
+* `handlers.py` — Telegram routing/UI;
+* `services.py` — бизнес-логика;
+* `database.py` — модели/БД;
+* `core.py` — конфигурация/константы;
+* `bot.py` — lifecycle.
 
 ---
 
@@ -56,28 +68,34 @@ angelok/
 
 ### Должно быть
 
-* загрузка конфигурации;
+* загрузка `.env`;
+* чтение конфигурации;
+* инициализация приложения;
 * инициализация БД;
-* создание Bot;
-* создание Dispatcher/Router;
-* регистрация handlers из:
-
-  * `handlers.py`;
-  * `games.py`;
-  * `rp.py`;
-  * `inventory.py`;
-  * `moderation.py`;
-* startup;
-* shutdown;
+* создание `Bot`;
+* создание `Dispatcher`;
+* регистрация handlers;
+* настройка Telegram command menu;
+* запуск background worker только там, где он действительно нужен;
+* graceful shutdown;
 * обработка ошибок верхнего уровня.
 
 ### Не должно быть
 
-* игровой логики;
+* игровой бизнес-логики;
 * SQL-запросов;
 * расчётов экономики;
 * RP-механики;
-* логики модерации.
+* инвентарной логики;
+* permission-логики.
+
+### Giveaway worker
+
+Разрешён один background worker для автоматического завершения giveaway.
+
+Worker не хранит состояние механики в памяти.
+
+Состояние giveaway всегда берётся из БД.
 
 ---
 
@@ -85,58 +103,71 @@ angelok/
 
 ## Ответственность
 
-Центральная конфигурация и константы.
+Центральная конфигурация, постоянные значения и игровые правила.
 
 ### 3.1 Конфигурация
 
-Существующие:
+Использовать:
 
-* BOT_TOKEN
-* OWNER_ID
-* DATABASE_URL
-* LOG_LEVEL
-* MESSAGE_REWARD_MIN
-* MESSAGE_REWARD_MAX
-* MESSAGE_XP
-* MESSAGE_REWARD_COOLDOWN
-* DAILY_BONUS_MIN
-* DAILY_BONUS_MAX
-* MIN_BET
-* MAX_BET
+* `BOT_TOKEN`
+* `OWNER_ID`
+* `DATABASE_URL`
+* `LOG_LEVEL`
+* `MESSAGE_REWARD_MIN`
+* `MESSAGE_REWARD_MAX`
+* `MESSAGE_XP`
+* `MESSAGE_REWARD_COOLDOWN`
+* `DAILY_BONUS_MIN`
+* `DAILY_BONUS_MAX`
+* `MIN_BET`
+* `MAX_BET`
 
 ### 3.2 XP
 
-Оставить существующую систему уровней, но привести к единой логике.
-
-Важно:
-
-> За каждое сообщение пользователь получает XP.
-
-Никакого cooldown для XP.
-
-То есть:
+За каждое обычное обработанное сообщение:
 
 ```text
-сообщение → +1 XP
-сообщение → +1 XP
-сообщение → +1 XP
++1 XP
 ```
 
-Антифлуд может существовать отдельно для выдачи арахиса, но **не имеет права блокировать XP**.
+Без cooldown.
+
+Антифлуд действует только на денежную награду за сообщение.
+
+Нельзя:
+
+```text
+cooldown → блок XP
+```
+
+Правильно:
+
+```text
+message
+→ +XP
+→ +Battle Pass XP
+→ отдельно проверка денежной награды
+```
+
+RP-команды не должны выдавать XP.
 
 ### 3.3 Battle Pass XP
 
 Отдельная система:
 
 ```text
-1 сообщение = +1 Battle Pass XP
+1 обычное сообщение = +1 Battle Pass XP
 ```
 
-Также без антифлуда.
+Без антифлуда.
 
-### 3.4 Уровневые разблокировки
+---
 
-Существующие:
+# 4. Уровни
+
+Сохраняется текущая формула уровней.
+
+Текущие feature unlock:
 
 ```text
 1  profile
@@ -152,95 +183,123 @@ angelok/
 20 crash
 ```
 
-Каждый игровой handler обязан проверять unlock.
+Проверка unlock должна происходить в service layer.
+
+Callback не может обходить unlock.
 
 ---
 
-# 4. Battle Pass
+# 5. Battle Pass
 
-## Цель
+## Состояние
 
-Добавить сезонный Battle Pass.
+Хранить в БД:
 
-### Состояние пользователя
+* `battle_pass_xp`;
+* `battle_pass_level`;
+* `battle_pass_season`.
 
-Хранить:
+## Прогресс
 
-* battle pass XP;
-* battle pass level;
-* season.
+Текущая модель:
 
-### Награды
+```text
+1 сообщение = +1 BP XP
+100 BP XP = +1 BP level
+```
 
-Каждый уровень получает конкретную награду.
+Максимальный уровень:
 
-Типы:
+```text
+30
+```
+
+## Типы наград
 
 * арахис;
 * XP;
 * кейс;
-* тег.
+* tag.
 
-### Финальная награда
+## Claim
 
-Последний уровень:
+Награда каждого уровня должна выдаваться только один раз.
+
+Использовать `BattlePassRewardClaim`.
+
+Повторная обработка сообщения или повторная попытка claim не должны повторно выдавать награду.
+
+## UI
+
+`/battlepass` должен показывать:
+
+* текущий уровень;
+* текущий BP XP;
+* XP до следующего уровня;
+* полученные награды;
+* текущую/следующую награду;
+* финальную награду.
+
+## Финальная награда
+
+Уникальный tag:
 
 ```text
 ЖИВАЯ ЛЕГЕНДА
 ```
 
-Награда — уникальный тег.
-
-### Команда
-
-```text
-/battlepass
-```
-
-Показывает:
-
-* текущий уровень;
-* XP;
-* XP до следующего уровня;
-* текущие/полученные награды;
-* следующую награду;
-* финальную награду.
-
 ---
 
-# 5. database.py
+# 6. database.py
 
 ## Ответственность
 
-Все SQLAlchemy модели и работа с БД.
+Только SQLAlchemy-модели и работа с БД.
 
-Не создавать отдельный `models.py`.
+Никакого отдельного `models.py`.
 
-## Необходимые сущности
+## User
 
-Использовать существующие модели, расширив их.
+Хранит Telegram-пользователя.
 
-### User / Profile
+## Chat
 
-Добавить необходимые поля:
+Хранит Telegram-chat.
 
-* XP;
-* battle pass XP;
-* battle pass season;
+## ChatMember
+
+Хранит состояние пользователя внутри конкретного чата:
+
+* balance;
+* messages;
+* xp;
+* level;
+* battle pass xp;
 * battle pass level;
+* battle pass season;
 * penis size;
-* disease state;
-* disease tick timestamp;
-* child state;
-* child expiration;
-* child support timestamp;
-* last robbery timestamp;
+* disease;
+* disease timestamps;
+* child;
+* child timestamps;
+* robbery cooldown;
+* message reward timestamp;
+* RP cooldown;
+* masturbation cooldown;
+* daily bonus timestamp;
 * выбранный tag;
-* необходимые cooldown timestamps.
+* игровые statistics;
+* profile nickname.
 
-### StaffMember
+## StaffMember
 
-Хранить:
+Привязка:
+
+```text
+chat_id + user_id
+```
+
+Роли:
 
 ```text
 OWNER
@@ -249,25 +308,11 @@ ADMIN
 MODERATOR
 ```
 
-Привязка:
+## ModPermission
 
-```text
-chat_id + user_id
-```
+Хранит permission конкретной moderation-команды.
 
-### ModPermission
-
-Хранить доступ к конкретной moderation-команде.
-
-Пример:
-
-```text
-warn → STAFF
-ban → ADMIN
-purge → HEAD_ADMIN
-```
-
-Возможные scopes:
+Scopes:
 
 ```text
 STAFF
@@ -275,9 +320,11 @@ ADMIN
 HEAD_ADMIN
 ```
 
-### InventoryItem
+`PURGE` не существует.
 
-Тип предмета.
+## InventoryItem
+
+Тип предмета и описание.
 
 Примеры:
 
@@ -291,212 +338,343 @@ condom
 tag
 ```
 
-### UserItem
+## UserItem
 
-Инвентарь пользователя.
+Связь пользователя и предмета.
 
-Нужна поддержка:
+Поддерживает:
 
 * quantity;
 * uses_left;
 * stackable;
 * max_quantity.
 
-### Tag
+## Tag
 
-Постоянное описание тега.
+Описание тега.
 
-### UserTag
+## UserTag
 
-Связь:
+Принадлежность тега пользователю.
 
-```text
-user → earned tag
-```
+Установить можно только tag, который реально есть у пользователя.
 
-Тег нельзя установить, если он не принадлежит пользователю.
+## Game
 
-### Giveaway
+Хранит историю завершённых игр.
 
-Хранить:
+## TicTacToeGame
+
+Хранит состояние TTT:
+
+* players;
+* board;
+* status;
+* current player;
+* bet;
+* message id.
+
+## Giveaway
+
+Хранит:
 
 * chat;
 * creator;
+* prize;
 * prize type;
-* prize amount/item;
-* duration/end time;
+* end time;
 * status;
-* winner.
+* winner;
+* completion timestamp.
 
-### GiveawayParticipant
+## GiveawayParticipant
 
-Участники розыгрыша.
+Участники giveaway.
 
-### Game
+Unique:
 
-Использовать существующую модель, если возможно.
+```text
+giveaway_id + user_id
+```
+
+## BattlePassRewardClaim
+
+Unique:
+
+```text
+chat_id + user_id + season + level
+```
 
 ---
 
-# 6. Миграция БД
+# 7. Миграция БД
 
-Главная задача:
+`create_all()` недостаточно для существующей БД.
 
-Не сломать существующую БД.
+В `database.py` используется простой compatibility layer:
 
-`create_all()` недостаточно для добавления новых колонок в существующие таблицы.
-
-В `database.py` реализовать максимально простой механизм совместимости:
-
-* проверить существование нужных колонок;
-* добавить отсутствующие колонки;
-* создать отсутствующие новые таблицы.
+1. определить существующие таблицы;
+2. определить существующие колонки;
+3. добавить отсутствующие колонки;
+4. создать отсутствующие таблицы;
+5. выполнить безопасный startup.
 
 Не создавать отдельный migration-файл.
 
-Если для конкретной PostgreSQL-конструкции автоматическое добавление невозможно — сделать безопасный fallback и явно сообщить при запуске.
+SQLite должен работать локально.
+
+PostgreSQL должен сохранять совместимость.
 
 ---
 
-# 7. services.py
+# 8. services.py
 
 ## Ответственность
 
-Общая бизнес-логика.
+Вся бизнес-логика проекта.
 
-### 7.1 Экономика
+Handler не должен сам рассчитывать:
 
-Функции:
+* экономику;
+* XP;
+* Battle Pass;
+* RP;
+* disease;
+* child;
+* item effects;
+* game payouts;
+* permissions.
 
-* get balance;
-* add peanuts;
-* remove peanuts;
+---
+
+# 9. Экономика
+
+Поддержать:
+
+* баланс;
+* добавление арахиса;
+* списание арахиса;
+* перевод;
+* проверку достаточности средств;
+* сообщение reward;
+* daily bonus;
+* game payout;
+* item compensation;
+* disease support cost;
+* child support;
+* RP cost.
+
+Все изменения баланса должны создавать `EconomyTransaction`.
+
+Баланс не может становиться отрицательным.
+
+---
+
+# 10. Transaction safety
+
+Денежные операции должны быть атомарными в рамках одной DB-транзакции.
+
+Особенно:
+
+* ставки;
+* выигрыши;
 * transfer;
-* проверка достаточности средств;
-* начисление за сообщение;
+* robbery;
+* RP cost;
+* medicine;
+* venereologist;
+* abortion;
+* child support;
+* case compensation;
+* Battle Pass peanuts;
 * daily bonus.
 
-### 7.2 XP
-
-Отдельно:
+Не допускать:
 
 ```text
-add_message_xp()
+double payout
+double charge
+negative balance
 ```
 
-Каждое сообщение:
+Конкурентные операции должны повторно проверять баланс под общей economy lock.
+
+---
+
+# 11. XP
+
+Каждое обычное сообщение:
 
 ```text
-+1 XP
+member.messages += 1
+member.xp += MESSAGE_XP
+member.battle_pass_xp += 1
 ```
 
-Без cooldown.
+Без XP cooldown.
 
 При переходе уровня:
 
-* определить новый уровень;
-* выдать награду уровня;
-* увеличить member size согласно настройке;
-* сообщить о новом уровне.
+1. определить `old_level`;
+2. определить `new_level`;
+3. обработать каждый новый уровень;
+4. выдать все положенные rewards;
+5. применить size reward;
+6. собрать unlocks;
+7. сформировать уведомление.
 
-### 7.3 Target resolver
+---
 
-Единый resolver для:
+# 12. Level rewards
+
+При переходе через несколько уровней:
+
+```text
+old = 2
+new = 5
+```
+
+обрабатываются:
+
+```text
+3
+4
+5
+```
+
+а не только уровень 5.
+
+Награды должны быть idempotent.
+
+---
+
+# 13. Message economy
+
+Экономическая награда за сообщение имеет отдельный cooldown.
+
+```text
+message XP
+    ↓
+всегда
+
+message money reward
+    ↓
+через cooldown
+```
+
+Таким образом:
+
+```text
+cooldown не влияет на XP
+```
+
+---
+
+# 14. Target resolver
+
+Единый принцип для target-based механик:
+
+1. reply;
+2. username;
+3. user id;
+4. self, если команда допускает self.
+
+Используется для:
 
 ```text
 /profile
-/profile @username
-/profile reply
 /stats
-/tag
 /rob
 RP
 ```
 
-Приоритет:
+Target должен существовать в текущем chat context для chat-specific действий.
 
-1. reply;
-2. username;
-3. собственный пользователь.
+---
 
-### 7.4 Disease reconciliation
+# 15. Disease reconciliation
 
-Не создавать отдельный scheduler.
+Не использовать отдельный scheduler.
 
-При любом обращении к пользователю:
+При обращении к пользователю:
 
 ```text
-если disease активна:
-    определить сколько часов прошло
-    применить все пропущенные ticks
+reconcile_member_state()
 ```
 
-Каждый tick:
+внутри которой выполняются:
 
 ```text
-penis_size -= 0.5
-charge 500 peanuts
+reconcile_disease()
+reconcile_child()
+reconcile_rubber_pussy_daily()
+```
+
+## Disease
+
+Если прошло несколько часов:
+
+```text
+for every missed hour:
+    penis_size -= 0.5
+    charge up to 500 peanuts
 ```
 
 Если денег недостаточно:
 
 * баланс не уходит в минус;
-* эффект болезни всё равно применяется.
+* size penalty всё равно применяется.
 
-### 7.5 Child reconciliation
+После tick timestamp сдвигается так, чтобы тот же tick не применился повторно.
 
-Аналогично.
+---
 
-При наличии ребёнка:
+# 16. Child reconciliation
+
+При активном child:
 
 ```text
 каждый прошедший час:
-    charge 10000 peanuts
+    charge up to 10000 peanuts
 ```
 
-После истечения 18 часов:
+Баланс не уходит ниже нуля.
+
+После:
 
 ```text
-child = false
+child_until <= now
 ```
 
-Пользователь снова получает возможность использовать 18+ RP.
+состояние child очищается.
 
-### 7.6 Robbery
+Пока child активен:
+
+```text
+18+ RP заблокирован
+```
+
+---
+
+# 17. Robbery
 
 Условия:
 
-* один раз в сутки;
-* только пользователь из того же чата;
-* размер жертвы меньше размера грабителя;
-* нельзя ограбить себя.
+* actor != target;
+* оба пользователя существуют в текущем chat;
+* actor size > target size;
+* target balance > 0;
+* cooldown 24 часа.
 
-Сумма ограбления — отдельная константа в `core.py`.
+Cooldown хранится в БД.
 
----
+Сама операция должна быть защищена economy lock.
 
-# 8. RP — rp.py
-
-## Главное правило
-
-Все RP-команды должны быть **не графическими**.
-
-18+ RP работает по той же архитектуре, что и обычный RP:
-
-```text
-команда
-→ target
-→ проверка цены
-→ проверка cooldown
-→ применение эффекта
-→ сообщение
-```
-
-Без описания сексуальных действий.
+Проигрыш robbery тоже считается попыткой и обновляет cooldown согласно текущей логике.
 
 ---
 
-# 9. Обычный RP
+# 18. Обычный RP
 
 Цена:
 
@@ -504,7 +682,7 @@ child = false
 10 🥜
 ```
 
-Существующие команды:
+Команды:
 
 ```text
 обнять
@@ -525,13 +703,22 @@ child = false
 кинуть тапок
 ```
 
+Обычный RP:
+
+* требует target;
+* не разрешается на себя;
+* списывает 10 🥜;
+* не даёт XP;
+* не даёт Battle Pass XP;
+* не содержит графических описаний.
+
 ---
 
-# 10. RP parser
+# 19. RP parser
 
-Исправить ошибку двухсловных команд.
+Parser должен поддерживать longest-match.
 
-Должны корректно распознаваться:
+Примеры:
 
 ```text
 дать пять
@@ -539,20 +726,18 @@ child = false
 кинуть тапок
 ```
 
-Parser должен использовать longest-match.
+Нельзя разбирать только первый токен.
 
-Нельзя делать:
+Порядок:
 
-```python
-parts = text.split(maxsplit=1)
-action = parts[0]
+```text
+сначала наиболее длинный alias
+потом более короткий
 ```
-
-для RP.
 
 ---
 
-# 11. 18+ RP
+# 20. 18+ RP
 
 Цена:
 
@@ -566,160 +751,108 @@ Cooldown:
 15 минут
 ```
 
-Команды регистрируются аналогично обычным RP.
+При наличии Rubber Pussy:
 
-Они не должны содержать графического текста.
+```text
+cooldown × 0.5
+```
 
-Каждая команда может иметь modifiers:
+18+ RP остаётся не графическим.
 
-* изменение размера;
-* шанс болезни;
-* шанс ребёнка;
-* шанс других эффектов;
-* использование предметов.
+Service отвечает только за игровые эффекты:
+
+* size;
+* cooldown;
+* disease;
+* child;
+* items.
 
 ---
 
-# 12. Member Size
+# 21. 18+ size modifiers
 
-Пользователь получает параметр:
-
-```text
-penis_size
-```
-
-Начальное значение:
+Размер actor:
 
 ```text
-0.0
++random gain × action modifier
 ```
 
-Размер:
-
-* увеличивается от 18+ RP;
-* может увеличиваться от уровня;
-* уменьшается от болезни;
-* изменяется предметами.
-
-Показывать размер в профиле.
-
-Добавить рейтинг:
+Размер target:
 
 ```text
-/top
+-random loss × action modifier
 ```
 
-или отдельный:
+Размер не может стать отрицательным.
+
+Lubricant:
 
 ```text
-/topsize
++5% к росту
 ```
 
-Сортировка по размеру.
+После применения lubricant расходуется.
 
 ---
 
-# 13. Modifiers 18+ RP
+# 22. Condom
 
-### Обычный эффект
+Condom используется автоматически при 18+ RP.
 
-Каждая подходящая RP-команда имеет свой modifier.
-
-### Lubricant
-
-Эффект:
+Если есть condom:
 
 ```text
-+5% к увеличению размера
+disease chance × (1 - 90%)
 ```
 
-Одно использование.
+То есть заболевание становится значительно менее вероятным.
 
-Stackable.
+Condom расходуется на использование.
 
-Количество не ограничено.
-
-### Dildo
-
-* максимум 1 предмет;
-* позволяет выполнить 3–5 дополнительных использований;
-* после исчерпания исчезает;
-* если выпадает повторно:
-
-  * вместо предмета +5000 🥜.
-
-### Rubber Pussy
-
-При получении:
-
-* уменьшает cooldown 18+ RP на 50%;
-* уменьшает cooldown «дрочки» на 50%;
-* 20% шанс +1 см в сутки;
-* даёт автоматическую механику «дрочки».
-
-«Дрочка»:
-
-```text
-+0.05–0.20 см
-```
-
-Cooldown:
-
-```text
-6 часов
-```
-
-### Silicone Implant
-
-При выпадении:
-
-```text
-+1 см
-```
-
-Автоматически применяется.
-
-Не хранится в инвентаре.
-
-### Condom
-
-Используется автоматически при 18+ RP.
-
-Stackable.
+Предмет stackable.
 
 ---
 
-# 14. Disease
+# 23. Disease
 
-При использовании 18+ RP на другого пользователя:
-
-```text
-50% chance disease
-```
-
-При наличии condom:
+Без condom:
 
 ```text
-90% protection
+50% chance
 ```
 
-То есть шанс заболевания значительно снижается.
+При наличие condom:
+
+```text
+эффективный шанс значительно ниже
+```
 
 Болезнь:
 
 ```text
-каждый час:
-    -0.5 см
-    -500 🥜
+persistent
+```
+
+Каждый час:
+
+```text
+-0.5 см
+-500 🥜 максимум
 ```
 
 ---
 
-# 15. Venereologist
+# 24. Medicine
 
-Если пользователь болен:
+Medicine очищает/смягчает состояние болезни согласно текущей механике.
 
-в профиле появляется кнопка:
+Стоимость и остальные значения находятся в `core.py`.
+
+---
+
+# 25. Venereologist
+
+Кнопка появляется в profile только при болезни:
 
 ```text
 🩺 Сходить к венерологу
@@ -731,7 +864,7 @@ Stackable.
 5000 🥜
 ```
 
-Шанс лечения:
+Chance:
 
 ```text
 20%
@@ -743,40 +876,62 @@ Stackable.
 disease = false
 ```
 
----
-
-# 16. Child mechanic
-
-При использовании 18+ RP на другого пользователя:
-
-### Без condom
+При провале:
 
 ```text
-15% chance
+disease сохраняется
 ```
-
-### С condom
-
-```text
-5% chance
-```
-
-При наступлении эффекта:
-
-* actor получает child;
-* 18+ RP блокируется;
-* длительность — 18 часов;
-* child support — 10000 🥜/час.
-
-Нельзя получить второй child одновременно.
 
 ---
 
-# 17. Abortion
+# 26. Child mechanic
 
-Если есть child:
+При 18+ RP:
 
-в профиле:
+Без condom:
+
+```text
+15%
+```
+
+С condom:
+
+```text
+5%
+```
+
+При срабатывании:
+
+```text
+actor.has_child = true
+actor.child_until = now + 18 hours
+```
+
+Второй child получить нельзя.
+
+---
+
+# 27. Child support
+
+Каждый прошедший час:
+
+```text
+-10000 🥜
+```
+
+После 18 часов:
+
+```text
+child = false
+```
+
+Время поддержки хранится в БД.
+
+---
+
+# 28. Abortion
+
+Кнопка:
 
 ```text
 👶 Дать денег на аборт
@@ -788,7 +943,7 @@ disease = false
 30000 🥜
 ```
 
-Шанс:
+Chance:
 
 ```text
 50%
@@ -803,69 +958,153 @@ child = false
 Провал:
 
 ```text
-child остаётся
+child сохраняется
 ```
 
 ---
 
-# 18. Inventory — inventory.py
-
-## Ответственность
-
-* кейсы;
-* предметы;
-* теги;
-* открытие кейсов;
-* использование предметов;
-* inline keyboards.
-
-### Кейсы
-
-Добавить:
-
-```text
-/open_case
-/cases
-```
-
-или аналогичную понятную систему.
-
-Кейс содержит случайную награду.
-
-Возможные награды:
-
-* арахис;
-* Lubricant;
-* Dildo;
-* Rubber Pussy;
-* Silicone Implant;
-* Condom;
-* Tag.
-
----
-
-# 19. Tags
-
-Убрать возможность пользователю самому назначать себе tag.
-
-Полностью убрать пользовательский `/settag`.
-
-Теги:
-
-* получаются из кейсов;
-* получаются из Battle Pass;
-* хранятся в UserTag;
-* нельзя выбрать чужой tag.
+# 29. Masturbation
 
 Команда:
 
 ```text
-/tag
+/masturbate
 ```
 
-доступна всем.
+Основной cooldown:
 
-Показывает inline buttons:
+```text
+6 часов
+```
+
+Rubber Pussy:
+
+```text
+cooldown × 0.5
+```
+
+Gain:
+
+```text
++0.05–0.20 см
+```
+
+При наличии Dildo:
+
+* cooldown может быть обойдён согласно текущей механике;
+* используется один charge;
+* количество uses уменьшается;
+* после исчерпания предмет удаляется.
+
+Cooldown и расход Dildo должны быть защищены от double callback.
+
+---
+
+# 30. Dildo
+
+Свойства:
+
+```text
+3–5 uses
+max 1
+```
+
+Если выпадает повторно:
+
+```text
++5000 🥜
+```
+
+Вместо второго Dildo.
+
+---
+
+# 31. Rubber Pussy
+
+При получении:
+
+```text
+18+ RP cooldown × 0.5
+masturbation cooldown × 0.5
+```
+
+Daily effect:
+
+```text
+20% chance +1 см в сутки
+```
+
+Должен применяться максимум один раз за сутки.
+
+---
+
+# 32. Silicone Implant
+
+При выпадении:
+
+```text
++1 см
+```
+
+Применяется автоматически.
+
+Не хранится как обычный usable item.
+
+---
+
+# 33. Inventory
+
+Кейсы и предметы должны храниться в БД.
+
+Inventory UI показывает:
+
+* предмет;
+* quantity;
+* uses_left, если применимо.
+
+Не создавать отдельное in-memory состояние.
+
+---
+
+# 34. Cases
+
+Кейс содержит weighted random reward.
+
+Возможные типы:
+
+```text
+peanuts
+lubricant
+dildo
+rubber_pussy
+silicone_implant
+condom
+tag
+```
+
+Открытие:
+
+```text
+case consumed
+reward granted
+```
+
+Один callback не должен выдавать награду повторно.
+
+---
+
+# 35. Tags
+
+Пользовательский `/settag` полностью удалён.
+
+Теги выдаются:
+
+* через cases;
+* через Battle Pass.
+
+`/tag` показывает только теги текущего пользователя.
+
+UI:
 
 ```text
 [ 🏷 Tag 1 ]
@@ -873,80 +1112,94 @@ child остаётся
 [ 🏷 Tag 3 ]
 ```
 
-Показываются только принадлежащие пользователю теги.
+Callback обязан дополнительно проверить принадлежность tag пользователю.
 
-После выбора:
-
-```text
-selected_tag = tag
-```
+Чужой tag назначить нельзя.
 
 ---
 
-# 20. Telegram native title
+# 36. Telegram native title
 
-Не пытаться выдавать обычным пользователям настоящий Telegram custom title через API.
+Не использовать Telegram custom title как основную систему обычных тегов.
 
-Telegram custom title имеет ограничения и не является обычным пользовательским профилем.
+Использовать bot-managed tags.
 
-Поэтому основная система:
-
-```text
-bot-managed tag
-```
-
-Tag показывается ботом:
+Формат:
 
 ```text
 👤 Username [ЖИВАЯ ЛЕГЕНДА]
 ```
 
-и в профиле.
-
 ---
 
-# 21. Games — games.py
+# 37. Games
 
-Все существующие игры перенести/собрать в одном файле.
-
-### Существующие
-
-* coinflip;
-* dice;
-* slots;
-* roulette;
-* tictactoe;
-* blackjack;
-* crash.
-
-### Новые
-
-* football;
-* basketball.
-
----
-
-# 22. Game unlock
-
-Каждая игра перед запуском проверяет:
+Поддерживаются:
 
 ```text
-is_feature_unlocked(user.level, feature)
+coinflip
+dice
+slots
+roulette
+guess
+football
+basketball
+tictactoe
+blackjack
+crash
 ```
 
-Если нет:
+Игровая бизнес-логика находится в `services.py`.
 
-```text
-🔒 Игра открывается с X уровня.
-```
-
-Нельзя обойти unlock через callback.
-
-Проверка должна выполняться и в callback handler.
+Игровой Telegram UI находится в `handlers.py`.
 
 ---
 
-# 23. Football
+# 38. Game unlock
+
+Перед запуском game service обязан проверить unlock.
+
+При callback также нельзя доверять только кнопке.
+
+Если уровень недостаточен:
+
+```text
+🔒 Игра открывается на X уровне.
+```
+
+---
+
+# 39. Game transaction flow
+
+Для каждой ставки:
+
+```text
+validate bet
+↓
+reconcile state
+↓
+check unlock
+↓
+check balance
+↓
+recheck balance under economy lock
+↓
+charge stake
+↓
+determine result
+↓
+payout
+↓
+write Game
+↓
+commit
+```
+
+Повторный callback не должен повторно выдавать payout.
+
+---
+
+# 40. Football
 
 Unlock:
 
@@ -956,19 +1209,23 @@ level 5
 
 Есть ставка.
 
-Минимум/максимум ставки берутся из Config.
-
 Результат определяется случайно.
 
-После игры:
+Win:
 
-* проигрыш → ставка списана;
-* выигрыш → приз начислен;
-* ничья → отдельная логика.
+```text
+payout according to FOOTBALL_MULTIPLIER
+```
+
+Loss:
+
+```text
+stake lost
+```
 
 ---
 
-# 24. Basketball
+# 41. Basketball
 
 Unlock:
 
@@ -978,111 +1235,219 @@ level 7
 
 Есть ставка.
 
-Аналогичная безопасная транзакционная модель.
+Результат определяется случайно.
+
+Win:
+
+```text
+payout according to BASKETBALL_MULTIPLIER
+```
+
+Loss:
+
+```text
+stake lost
+```
 
 ---
 
-# 25. Tic-Tac-Toe
+# 42. Tic-Tac-Toe
 
-Исправить текущий баг.
+Unlock:
 
-Сейчас создаётся callback:
+```text
+level 10
+```
+
+Минимальная ставка:
+
+```text
+10 🥜
+```
+
+Flow:
+
+```text
+start
+↓
+waiting
+↓
+join
+↓
+playing
+↓
+moves
+↓
+win/draw
+```
+
+Join callback:
 
 ```text
 tttjoin:{game.id}
 ```
 
-но handler его не обрабатывает.
+обязательно обрабатывается.
 
-Добавить:
+Проверять:
+
+* game exists;
+* waiting/playing status;
+* participant;
+* second player;
+* balance;
+* self-join;
+* turn;
+* cell ownership;
+* cell availability;
+* finished state.
+
+Draw:
 
 ```text
-tttjoin:
+stake refund
 ```
 
-Проверить:
+Оба игрока получают корректно записанную игровую статистику.
 
-* существование игры;
-* статус;
-* первого игрока;
-* второго игрока;
-* ставку;
-* нельзя присоединиться самому к себе;
-* нельзя войти в уже начатую игру;
-* нельзя сыграть в чужую завершённую игру.
+Win:
+
+```text
+winner payout
+loser stake lost
+```
 
 ---
 
-# 26. Game transactions
+# 43. Blackjack
 
-Для игр со ставкой:
+Минимальная ставка:
 
-1. проверить баланс;
-2. списать ставку;
-3. создать game;
-4. определить результат;
-5. начислить выигрыш;
-6. сохранить результат.
+```text
+10 🥜
+```
 
-Не допускать повторного callback, который выдаёт награду несколько раз.
+Win:
+
+```text
+2.0x
+```
+
+Natural:
+
+```text
+2.5x
+```
+
+Draw:
+
+```text
+refund
+```
+
+Все операции money должны быть атомарными.
 
 ---
 
-# 27. Giveaways
+# 44. Crash
 
-Добавить систему розыгрышей.
+Unlock:
 
-### Создание
+```text
+level 20
+```
 
-Только разрешённые staff.
+Min bet:
 
-Параметры:
+```text
+10 🥜
+```
 
-* приз;
-* тип приза;
-* время окончания.
+Multiplier range:
 
-### Призы
+```text
+1.10x–10.00x
+```
 
-Поддержать:
+Текущая реализация — одношаговый симулятор:
+
+```text
+ставка
+↓
+выбор cashout multiplier
+↓
+генерация crash multiplier
+↓
+win/loss
+```
+
+Это не должно требовать in-memory game session.
+
+---
+
+# 45. Giveaways
+
+Создание доступно разрешённым staff.
+
+Типы призов:
 
 ```text
 peanuts
 inventory item
-external/manual prize
+external/manual
 ```
 
-### Участие
-
-Inline button:
+Участие через inline button:
 
 ```text
 🎁 Участвовать
 ```
 
-Один пользователь — один участник.
-
-### Завершение
-
-Случайно выбрать одного участника.
-
-Если приз внутренний:
+Один пользователь:
 
 ```text
-автоматически выдать
-```
-
-Если external:
-
-```text
-показать победителя + пометить приз как manual
+один giveaway → один participant
 ```
 
 ---
 
-# 28. Moderation — moderation.py
+# 46. Giveaway completion
 
-## Роли
+При завершении:
+
+1. получить active giveaway;
+2. получить participants;
+3. выбрать winner;
+4. сохранить winner;
+5. выдать внутренний приз;
+6. external prize пометить как manual;
+7. изменить status;
+8. сохранить completion timestamp.
+
+Повторное завершение не должно выдавать приз повторно.
+
+---
+
+# 47. Giveaways persistence
+
+Статус:
+
+```text
+active
+finished
+```
+
+хранится в БД.
+
+Автоматическое завершение выполняется worker'ом в `bot.py`.
+
+Worker только находит просроченные записи и вызывает service.
+
+---
+
+# 48. Moderation
+
+Роли:
 
 ```text
 OWNER
@@ -1091,41 +1456,19 @@ ADMIN
 MODERATOR
 ```
 
-### Owner
-
-Задаётся через:
+Owner определяется через:
 
 ```text
 OWNER_ID
 ```
 
-Owner:
-
-* назначает Head Admin.
-
-### Head Admin
-
-Может:
-
-* назначать Admin;
-* снимать Admin;
-* назначать Moderator;
-* снимать Moderator;
-* менять доступ moderation-команд.
-
-### Admin
-
-Права определяются permission system.
-
-### Moderator
-
-Права определяются permission system.
+Owner выше локальной staff hierarchy.
 
 ---
 
-# 29. Moderation permissions
+# 49. Moderation permissions
 
-Каждая moderation-команда имеет scope:
+Scopes:
 
 ```text
 STAFF
@@ -1133,153 +1476,161 @@ ADMIN
 HEAD_ADMIN
 ```
 
-### STAFF
-
-Доступ:
+Расшифровка:
 
 ```text
-moderator + admin + head admin
+STAFF
+→ moderator + admin + head admin
+
+ADMIN
+→ admin + head admin
+
+HEAD_ADMIN
+→ head admin
 ```
 
-### ADMIN
-
-Доступ:
-
-```text
-admin + head admin
-```
-
-### HEAD_ADMIN
-
-Доступ:
-
-```text
-head admin
-```
-
-Owner всегда выше системы.
+Owner всегда имеет доступ.
 
 ---
 
-# 30. Moderation commands
+# 50. Moderation commands
 
-Сохранить/исправить:
+Поддерживаются текущие:
 
 ```text
 /warn
 /unwarn
+/warnings
 /mute
 /unmute
 /ban
 /unban
 /kick
-/purge
 /setnick
+/setrole
+/delrole
+/setperm
 ```
 
-Убрать:
+Также:
 
 ```text
-/settag
+/give
+/take
+/setbalance
+/setlevel
 ```
+
+для разрешённых staff.
+
+`/settag` отсутствует.
+
+`/purge` отсутствует.
 
 ---
 
-# 31. Staff management
+# 51. Staff management
 
-Добавить команды для управления ролями.
-
-Например:
+Поддержать текущую систему:
 
 ```text
-/setheadadmin
-/removeheadadmin
-
-/setadmin
-/removeadmin
-
-/setmoderator
-/removemoderator
+/setrole
+/delrole
 ```
 
-Точные aliases можно определить при реализации.
+или существующие aliases внутри текущей архитектуры.
+
+Нельзя дать роль выше собственных полномочий.
 
 ---
 
-# 32. Permission management
+# 52. Permission management
 
-Head Admin должен иметь возможность изменить доступ каждой moderation-команды.
+Head Admin может изменять permission moderation-команд.
 
-Например:
+Настройка сохраняется в БД.
 
-```text
-/modpermission warn staff
-/modpermission ban admin
-/modpermission purge head_admin
-```
-
-После изменения сохранять в БД.
+Owner всегда выше permission system.
 
 ---
 
-# 33. Purge
+# 53. Command cleanup
 
-Текущий `/purge` фактически ничего не удаляет.
-
-Исправить.
-
-Например:
+В группах:
 
 ```text
-/purge 20
-```
-
-Бот пытается удалить:
-
-* команду;
-* последние N сообщений.
-
-Учитывать:
-
-* права Telegram;
-* невозможность удалить некоторые старые сообщения;
-* ошибки Telegram API.
-
-Удаление должно выполняться через реальные:
-
-```python
-bot.delete_message(...)
-```
-
----
-
-# 34. Command cleanup
-
-По возможности после ответа бота пользовательские команды удаляются.
-
-Например:
-
-```text
-/user command
-       ↓
+command
+↓
 bot response
-       ↓
-delete command
+↓
+temporary cleanup
 ```
 
-Но удаление не должно ломать callback/game flow.
+Текущая политика:
 
-Все удаления — через безопасный helper:
+```text
+GROUP_COMMAND_TTL = 5 sec
+GROUP_BOT_MESSAGE_TTL = 30 sec
+PRIVATE_BOT_MESSAGE_TTL = 0
+```
+
+Ошибки удаления не должны падать в handler.
+
+Использовать:
 
 ```text
 safe_delete_message()
 ```
 
-Ошибки удаления не должны падать в handler.
+Message tracking отсутствует.
+
+Callback messages с inline UI не должны удаляться так, чтобы ломать игровой flow.
 
 ---
 
-# 35. Profile
+# 54. Bottom ReplyKeyboard
+
+Основная навигация должна использовать нижнюю ReplyKeyboard:
+
+```text
+👤 Профиль
+📊 Стата
+🥜 Баланс
+🎒 Инвентарь
+🎮 Игры
+🏆 Топ
+📏 Топ размера
+🎁 Бонус
+🏅 Battle Pass
+🏷 Теги
+```
+
+Кнопки ведут к соответствующим разделам.
+
+Основные игровые действия должны по возможности использовать inline keyboard.
+
+---
+
+# 55. Inline UI
+
+Использовать inline buttons для:
+
+* разделов профиля;
+* disease/medicine;
+* venereologist;
+* child/abortion;
+* Battle Pass;
+* cases;
+* tags;
+* games;
+* TTT;
+* giveaways.
+
+Основные интерактивные сценарии не должны требовать от пользователя ручного повторного ввода там, где можно использовать callback.
+
+---
+
+# 56. Profile
 
 Команда:
 
@@ -1287,62 +1638,75 @@ safe_delete_message()
 /profile
 ```
 
-Показывает собственный профиль.
-
-Поддержать:
-
-```text
-/profile @username
-```
-
-и reply:
+Поддержка:
 
 ```text
 /profile
+/profile @username
+/profile USER_ID
 ```
 
-ответом на сообщение пользователя.
+и reply.
 
 Показывать:
 
 * username;
+* nickname;
 * tag;
 * level;
 * XP;
 * balance;
 * penis size;
 * disease;
-* child status;
-* cooldown-related information;
+* child;
 * Battle Pass;
-* inventory-related summary.
+* краткий inventory summary;
+* cooldown information по необходимости.
 
-Если есть disease:
+Если disease:
 
 ```text
 🩺 Сходить к венерологу
 ```
 
-Если есть child:
+Если child:
 
 ```text
 👶 Дать денег на аборт
 ```
 
+Переходы выполняются через callbacks.
+
 ---
 
-# 36. Top
+# 57. Stats
 
-Добавить рейтинг размера:
+Показывать:
 
-```text
-/topsize
-```
+* messages;
+* XP;
+* level;
+* games;
+* wins/losses;
+* total won/lost;
+* size;
+* Battle Pass progress.
 
-или:
+---
+
+# 58. Top
+
+Поддержать:
 
 ```text
 /top
+/topsize
+```
+
+Размер сортируется по:
+
+```text
+penis_size DESC
 ```
 
 Показывать:
@@ -1355,272 +1719,117 @@ safe_delete_message()
 
 ---
 
-# 37. Daily robbery
+# 59. Error handling
 
-Команда:
+Ожидаемые ошибки превращаются в ServiceResult:
 
-```text
-/rob @username
-```
+* user not found;
+* target not found;
+* callback expired;
+* insufficient balance;
+* cooldown;
+* locked game;
+* missing item;
+* finished game;
+* finished giveaway;
+* no permission.
 
-или reply.
-
-Условия:
-
-* один раз в 24 часа;
-* размер нападающего строго больше размера цели;
-* цель существует;
-* нельзя rob самого себя.
-
-Cooldown хранится в БД.
+Telegram API errors не должны ронять dispatcher.
 
 ---
 
-# 38. Message processing
+# 60. Callback security
 
-Каждое обычное сообщение должно корректно проходить через:
+Каждый callback повторно проверяет необходимые условия.
 
-```text
-message
- ↓
-find/create user
- ↓
-+1 normal XP
- ↓
-+1 Battle Pass XP
- ↓
-level calculation
- ↓
-level rewards if level increased
- ↓
-economy reward separately
-```
+Проверять:
 
-Главное:
+* callback user id;
+* target;
+* game state;
+* game participant;
+* permissions;
+* ownership;
+* item ownership;
+* giveaway status;
+* cooldown;
+* unlock;
+* balance.
 
-**никакой cooldown не должен блокировать XP.**
+Inline button не считается доверенным источником состояния.
 
 ---
 
-# 39. Level rewards
+# 61. Idempotency
 
-При достижении уровня:
+Ключевые системы не должны повторно выдавать reward:
 
-* проверить все новые уровни между old_level и new_level;
-* выдать награды каждого уровня;
-* увеличить member size согласно настройке;
-* не выдавать одну награду повторно.
-
-Награды должны быть idempotent.
-
----
-
-# 40. Idempotency
-
-Особенно важно для:
-
-* games;
-* giveaways;
+* game payout;
+* game stake;
+* TTT win;
+* TTT draw;
+* blackjack refund;
+* giveaway winner/prize;
 * case opening;
-* Battle Pass rewards;
-* level rewards;
-* callbacks;
+* Battle Pass reward;
+* item compensation;
 * disease ticks;
-* child support.
+* child support;
+* daily bonus.
 
-Повторный callback не должен повторно выдавать деньги/предмет.
+Использовать:
+
+* DB state;
+* unique constraints;
+* timestamps;
+* service-level locks;
+* повторные проверки состояния.
 
 ---
 
-# 41. Cooldowns
+# 62. Persistence
 
-Все cooldown должны храниться по timestamp.
+После restart должны сохраняться:
+
+```text
+XP
+level
+Battle Pass
+inventory
+tags
+selected tag
+size
+disease
+child
+cooldowns
+game history
+giveaway state
+staff roles
+permissions
+```
+
+Никакая из этих механик не должна зависеть от runtime-only in-memory session.
+
+---
+
+# 63. Configurable constants
+
+Все balance-related значения находятся в `core.py`.
 
 Основные:
-
-```text
-18+ RP       = 15 min
-дрочка       = 6 hours
-rob          = 24 hours
-```
-
-Модификаторы:
-
-```text
-Rubber Pussy:
-18+ RP cooldown × 0.5
-дрочка cooldown × 0.5
-```
-
----
-
-# 42. Item behavior
-
-## Lubricant
-
-```text
-+5% к modifier увеличения размера
-one-use
-stackable
-```
-
-## Dildo
-
-```text
-3–5 дополнительных использований
-max 1
-после использования исчезает
-duplicate → +5000 peanuts
-```
-
-## Rubber Pussy
-
-```text
-18+ cooldown × 0.5
-дрочка cooldown × 0.5
-20% daily +1 cm
-автоматическая дрочка +0.05–0.20 cm
-```
-
-## Silicone Implant
-
-```text
-instant +1 cm
-auto-consume
-```
-
-## Condom
-
-```text
-auto-use
-90% protection from disease
-stackable
-```
-
----
-
-# 43. Disease details
-
-Disease is persistent.
-
-Stored in database.
-
-При каждом обращении:
-
-```text
-reconcile_disease()
-```
-
-Если прошло несколько часов:
-
-```text
-for every missed hour:
-    size -= 0.5
-    balance -= up to 500
-```
-
-Timestamp после обработки должен быть сдвинут корректно, чтобы эффект не применялся повторно.
-
----
-
-# 44. Child details
-
-Child state:
-
-```text
-child_until
-last_child_support
-```
-
-При каждом обращении:
-
-```text
-reconcile_child()
-```
-
-Каждый прошедший час:
-
-```text
--10000 peanuts
-```
-
-После 18 часов:
-
-```text
-child removed
-```
-
-Пока child активен:
-
-```text
-18+ RP запрещено
-```
-
----
-
-# 45. Error handling
-
-Нельзя допускать падение бота из-за:
-
-* отсутствующего пользователя;
-* удалённого сообщения;
-* старого callback;
-* повторного callback;
-* недостатка денег;
-* отсутствующего предмета;
-* Telegram permissions;
-* неправильного username;
-* уже завершённой игры.
-
-Все ожидаемые ошибки должны превращаться в нормальный ответ пользователю.
-
----
-
-# 46. Transaction safety
-
-Денежные операции должны выполняться атомарно.
-
-Особенно:
-
-* ставки;
-* выигрыши;
-* rob;
-* medicine;
-* abortion;
-* child support;
-* case duplicate compensation;
-* RP payment.
-
-Нельзя допустить:
-
-```text
-деньги списались дважды
-```
-
-или:
-
-```text
-выигрыш выдан дважды
-```
-
----
-
-# 47. Configurable constants
-
-В `core.py` вынести настройки:
 
 ```text
 NORMAL_RP_COST = 10
 ADULT_RP_COST = 50
 
-ADULT_RP_COOLDOWN = 15 minutes
-MASTURBATION_COOLDOWN = 6 hours
+ADULT_RP_COOLDOWN = 15 min
+MASTURBATION_COOLDOWN = 6 h
 
 DISEASE_CHANCE = 50%
 CONDOM_PROTECTION = 90%
 
 DISEASE_SIZE_LOSS = 0.5
-DISEASE_MEDICINE_TICK_COST = 500
+DISEASE_TICK_COST = 500
 VENEREOLOGIST_COST = 5000
 VENEREOLOGIST_CURE_CHANCE = 20%
 
@@ -1628,7 +1837,7 @@ PREGNANCY_CHANCE = 15%
 PREGNANCY_CHANCE_WITH_CONDOM = 5%
 
 CHILD_SUPPORT = 10000
-CHILD_DURATION = 18 hours
+CHILD_DURATION = 18 h
 
 ABORTION_COST = 30000
 ABORTION_SUCCESS_CHANCE = 50%
@@ -1640,382 +1849,582 @@ SILICONE_IMPLANT_BONUS = 1.0
 MASTURBATION_MIN_GAIN = 0.05
 MASTURBATION_MAX_GAIN = 0.20
 
-ROB_COOLDOWN = 24 hours
+ROB_COOLDOWN = 24 h
 ```
 
-Все спорные балансные значения должны находиться в одном месте.
+---
+
+# 64. Case balancing
+
+Drop rates должны храниться в `core.py`.
+
+Не размещать вероятности внутри handlers.
 
 ---
 
-# 48. Case balancing
+# 65. Final audit
 
-Все drop rates находятся в `core.py`.
-
-Не размазывать вероятности по handlers.
-
-Пример:
+После завершения основной реализации необходимо проверить связку:
 
 ```text
-peanuts
-lubricant
-dildo
-rubber_pussy
-silicone_implant
-condom
-tag
-```
-
-Точные вероятности можно балансировать без изменения бизнес-логики.
-
----
-
-# 49. Telegram callback security
-
-Каждый callback должен повторно проверять:
-
-* user id;
-* game ownership;
-* item ownership;
-* permissions;
-* game state;
-* giveaway state;
-* target;
-* cooldown.
-
-Нельзя полагаться только на наличие inline button.
-
----
-
-# 50. Проверка после реализации
-
-После каждого этапа проверить:
-
-## База
-
-* запускается SQLite;
-* подключается PostgreSQL;
-* существующая база не ломается;
-* новые таблицы создаются.
-
-## XP
-
-* каждое сообщение даёт XP;
-* cooldown не блокирует XP;
-* Battle Pass XP начисляется каждое сообщение.
-
-## Profile
-
-* свой профиль;
-* профиль по username;
-* профиль reply.
-
-## RP
-
-* обычный RP;
-* двухсловные RP;
-* цена 10;
-* 18+ цена 50;
-* cooldown;
-* target;
-* modifiers.
-
-## Items
-
-* case;
-* lubricant;
-* dildo;
-* rubber pussy;
-* implant;
-* condom;
-* tags.
-
-## Disease
-
-* заражение;
-* condom protection;
-* hourly tick;
-* medicine;
-* venereologist;
-* cure chance.
-
-## Child
-
-* pregnancy;
-* support;
-* RP lock;
-* abortion;
-* expiration.
-
-## Games
-
-* unlock;
-* ставки;
-* payouts;
-* TTT join;
-* callbacks.
-
-## Moderation
-
-* owner;
-* head admin;
-* admin;
-* moderator;
-* permissions;
-* purge.
-
-## Giveaways
-
-* join;
-* duplicate join prevention;
-* random winner;
-* automatic prize;
-* manual prize.
-
----
-
-# 51. Этапы реализации
-
-## Этап 1 — база и инфраструктура
-
-Файлы:
-
-```text
+handlers.py
+↔
+services.py
+↔
 database.py
-core.py
-services.py
-```
-
-Сделать:
-
-* новые поля;
-* новые модели;
-* migration compatibility;
-* economy;
-* XP;
-* Battle Pass state;
-* timestamps;
-* target resolver.
-
----
-
-## Этап 2 — RP
-
-Файлы:
-
-```text
-rp.py
-services.py
+↔
 core.py
 ```
-
-Сделать:
-
-* parser;
-* обычный RP;
-* 18+ RP;
-* цены;
-* cooldown;
-* size;
-* disease;
-* child;
-* robbery;
-* reconciliation.
-
----
-
-## Этап 3 — Inventory / Cases / Tags
-
-Файлы:
-
-```text
-inventory.py
-database.py
-core.py
-handlers.py
-```
-
-Сделать:
-
-* cases;
-* drops;
-* inventory;
-* tags;
-* `/tag`;
-* использование предметов.
-
----
-
-## Этап 4 — Games
-
-Файлы:
-
-```text
-games.py
-handlers.py
-core.py
-services.py
-```
-
-Сделать:
-
-* unlock;
-* football;
-* basketball;
-* TTT join;
-* ставки;
-* callback security.
-
----
-
-## Этап 5 — Moderation
-
-Файлы:
-
-```text
-moderation.py
-database.py
-handlers.py
-```
-
-Сделать:
-
-* roles;
-* permissions;
-* role management;
-* moderation;
-* purge;
-* setnick;
-* убрать settag.
-
----
-
-## Этап 6 — Battle Pass / Giveaways / Profile UI
-
-Файлы:
-
-```text
-handlers.py
-services.py
-inventory.py
-```
-
-Сделать:
-
-* Battle Pass;
-* rewards;
-* final tag;
-* giveaways;
-* profile buttons;
-* disease button;
-* abortion button;
-* top.
-
----
-
-## Этап 7 — Integration
 
 Проверить:
 
-* imports;
-* circular dependencies;
+* все imports;
+* все service signatures;
+* все callback prefixes;
+* все команды;
+* все model fields;
+* все database aliases/synonyms;
+* все permission scopes;
+* все feature unlocks.
+
+---
+
+# 66. Static checks
+
+Перед объявлением готовности выполнить минимум:
+
+```text
+python -m py_compile bot.py core.py database.py services.py handlers.py
+```
+
+Также проверить:
+
+```text
+python import checks
+database initialization checks
+```
+
+при доступном окружении.
+
+---
+
+# 67. Database checks
+
+Проверить:
+
+## SQLite
+
+* новая БД создаётся;
+* существующая БД запускается;
+* отсутствующие колонки добавляются;
+* новые таблицы создаются.
+
+## PostgreSQL
+
+* URL корректно разбирается;
+* async driver используется;
+* модели создаются/совместимы;
+* compatibility layer не содержит SQLite-only логики.
+
+---
+
+# 68. XP checks
+
+Проверить:
+
+```text
+message #1 → +1 XP
+message #2 → +1 XP
+message #3 → +1 XP
+```
+
+Даже если денежный reward cooldown ещё не истёк.
+
+Отдельно:
+
+```text
+message → +1 BP XP
+```
+
+RP:
+
+```text
+RP → no XP
+```
+
+---
+
+# 69. Profile checks
+
+Проверить:
+
+```text
+/profile
+/profile @username
+/profile reply
+```
+
+и callback-кнопки:
+
+```text
+medicine
+venereologist
+abortion
+```
+
+---
+
+# 70. RP checks
+
+Проверить все команды:
+
+```text
+обнять
+пожать
+поцеловать
+пнуть
+ударить
+погладить
+подмигнуть
+дать пять
+поздравить
+пожалеть
+рассмешить
+напугать
+ткнуть
+укусить
+дать подзатыльник
+кинуть тапок
+```
+
+Отдельно:
+
+```text
+longest-match parser
+```
+
+---
+
+# 71. 18+ checks
+
+Проверить:
+
+```text
+cost = 50
+cooldown = 15 min
+Rubber Pussy = ×0.5
+```
+
+Также:
+
+* lubricant;
+* dildo;
+* rubber pussy;
+* silicone implant;
+* condom;
+* disease;
+* child.
+
+---
+
+# 72. Disease checks
+
+Проверить:
+
+```text
+infection
+condom protection
+missed hourly ticks
+size loss
+balance charge
+insufficient balance
+medicine
+venereologist
+```
+
+Особенно:
+
+```text
+repeated reconciliation
+```
+
+не должна повторно применять один и тот же tick.
+
+---
+
+# 73. Child checks
+
+Проверить:
+
+```text
+pregnancy chance
+condom chance
+child lock
+hourly support
+insufficient balance
+18h expiration
+abortion
+```
+
+---
+
+# 74. Inventory checks
+
+Проверить:
+
+```text
+case quantity
+case open
+lubricant consumption
+dildo uses
+dildo expiration
+duplicate dildo compensation
+rubber pussy
+implant instant effect
+condom consumption
+tag ownership
+```
+
+---
+
+# 75. Game checks
+
+Проверить:
+
+```text
+coinflip
+dice
+slots
+roulette
+guess
+football
+basketball
+tictactoe
+blackjack
+crash
+```
+
+Для каждой:
+
+* unlock;
+* min/max bet;
+* balance;
+* payout;
+* Game record;
+* repeated callback.
+
+---
+
+# 76. TTT checks
+
+Отдельно проверить:
+
+```text
+start
+join
+self join
+third player
+wrong participant
+wrong turn
+occupied cell
+win
+draw
+refund
+stats
+finished callback
+```
+
+---
+
+# 77. Giveaway checks
+
+Проверить:
+
+```text
+create
+join
+duplicate join
+finish
+random winner
+automatic peanuts
+automatic item
+manual external prize
+expired auto-finish
+double finish
+```
+
+---
+
+# 78. Moderation checks
+
+Проверить:
+
+```text
+owner
+head admin
+admin
+moderator
+permissions
+setrole
+delrole
+setperm
+warn
+unwarn
+warnings
+mute
+unmute
+ban
+unban
+kick
+setnick
+```
+
+Проверить, что `purge` нигде не существует.
+
+---
+
+# 79. Purge exclusion check
+
+Обязательный финальный grep/search:
+
+```text
+purge
+message tracking
+tracking model
+```
+
+Допускаются только исторические пояснения в git/старых документах, но в рабочем коде:
+
+```text
+нет purge handler
+нет purge permission
+нет purge command
+нет tracking model
+нет tracking service
+```
+
+---
+
+# 80. UI finalization
+
+После функционального аудита выполняется отдельный cosmetic pass.
+
+Приоритет:
+
+1. Profile;
+2. Battle Pass;
+3. Inventory;
+4. Cases;
+5. Games;
+6. TTT;
+7. Top/Stats;
+8. navigation.
+
+Цель:
+
+* меньше лишнего текста;
+* больше inline navigation;
+* единый стиль;
+* понятные кнопки;
+* короткие ответы;
+* отсутствие визуального мусора в групповых чатах.
+
+---
+
+# 81. Current implementation stages
+
+## Этап 1 — handlers
+
+Статус:
+
+```text
+DONE
+```
+
+Сделано:
+
+* ReplyKeyboard;
+* inline navigation;
 * callback routing;
-* command routing;
-* database startup;
-* existing functionality;
-* configuration.
+* profile actions;
+* games UI;
+* TTT join;
+* case UI;
+* tag UI;
+* Battle Pass UI;
+* command cleanup;
+* удаление purge;
+* удаление message tracking.
 
 ---
 
-# 52. Финальная проверка
+## Этап 2 — services
 
-Перед объявлением работы завершённой:
+Статус:
 
-### Commands
+```text
+DONE
+```
 
-Проверить все существующие команды.
+Сделано:
 
-### Games
+* economy;
+* XP;
+* Battle Pass;
+* RP;
+* 18+ RP;
+* disease;
+* child;
+* items;
+* cases;
+* tags;
+* games;
+* TTT;
+* giveaways;
+* moderation;
+* reconciliation.
 
-Проверить каждую игру.
-
-### RP
-
-Проверить каждую RP-команду.
-
-### Database
-
-Проверить существующую БД.
-
-### Permissions
-
-Проверить каждую moderation-команду.
-
-### Callbacks
-
-Проверить каждый callback prefix.
-
-### Economy
-
-Проверить каждую операцию с арахисом.
-
-### Persistence
-
-Перезапустить бота и убедиться, что:
-
-* XP сохранён;
-* level сохранён;
-* Battle Pass сохранён;
-* inventory сохранён;
-* tags сохранены;
-* disease сохранена;
-* child сохранён;
-* cooldown timestamps сохранены;
-* games не могут быть использованы повторно;
-* giveaway state сохранён.
+Осталось пройти финальный race/idempotency audit.
 
 ---
 
-# 53. Definition of Done
+## Этап 3 — bot
 
-Работа считается завершённой только когда:
+Статус:
+
+```text
+DONE
+```
+
+Сделано:
+
+* startup;
+* shutdown;
+* DB initialization;
+* Telegram command menu;
+* giveaway worker;
+* удаление purge из command menu.
+
+---
+
+## Этап 4 — final audit
+
+Статус:
+
+```text
+IN PROGRESS
+```
+
+Нужно:
+
+* проверить transaction safety;
+* проверить concurrent economy operations;
+* проверить repeated callbacks;
+* проверить Battle Pass claim idempotency;
+* проверить disease/child reconciliation;
+* проверить полный callback routing;
+* проверить database compatibility;
+* провести syntax/import tests.
+
+---
+
+## Этап 5 — cosmetic pass
+
+После финального audit:
+
+* Battle Pass UI;
+* profile UI;
+* inventory UI;
+* games UI;
+* навигация;
+* тексты;
+* компактность ответов.
+
+---
+
+# 82. Definition of Done
+
+Работа считается завершённой, когда:
 
 * [ ] максимум 10 основных файлов;
+* [ ] фактическая архитектура соответствует 9-файловой структуре;
+* [ ] purge полностью удалён;
+* [ ] message tracking полностью удалён;
 * [ ] TTT работает;
+* [ ] TTT join работает;
+* [ ] TTT callbacks проверяют игрока и состояние;
 * [ ] профиль другого пользователя работает;
+* [ ] `/profile @username` работает;
+* [ ] `/profile` reply работает;
 * [ ] двухсловные RP работают;
 * [ ] football работает;
 * [ ] basketball работает;
 * [ ] game unlock реально работает;
+* [ ] callback не обходит unlock;
 * [ ] Battle Pass работает;
-* [ ] каждое сообщение даёт XP;
-* [ ] антифлуд не блокирует XP;
-* [ ] награды Battle Pass работают;
+* [ ] каждое обычное сообщение даёт XP;
+* [ ] cooldown не блокирует XP;
+* [ ] каждое обычное сообщение даёт BP XP;
+* [ ] RP не даёт XP;
+* [ ] награды Battle Pass idempotent;
 * [ ] финальный tag выдаётся;
-* [ ] `/settag` удалён;
+* [ ] `/settag` отсутствует;
 * [ ] `/tag` показывает только собственные tags;
 * [ ] cases работают;
 * [ ] items работают;
+* [ ] duplicate dildo даёт компенсацию;
+* [ ] silicone implant применяется автоматически;
 * [ ] size работает;
 * [ ] top size работает;
 * [ ] disease работает;
+* [ ] disease reconciliation работает;
 * [ ] medicine работает;
 * [ ] venereologist работает;
 * [ ] condom работает;
 * [ ] child mechanic работает;
 * [ ] child support работает;
+* [ ] child expiration работает;
 * [ ] abortion работает;
 * [ ] robbery работает;
+* [ ] robbery cooldown сохраняется;
 * [ ] normal RP стоит 10;
 * [ ] 18+ RP стоит 50;
 * [ ] 18+ cooldown работает;
 * [ ] masturbation cooldown работает;
 * [ ] moderation roles работают;
 * [ ] moderation permissions работают;
-* [ ] purge реально удаляет сообщения;
+* [ ] purge отсутствует;
 * [ ] giveaways работают;
+* [ ] duplicate giveaway join запрещён;
 * [ ] automatic prizes работают;
 * [ ] manual prizes работают;
-* [ ] существующие функции не сломаны;
+* [ ] balance не становится отрицательным;
+* [ ] double payout невозможен;
+* [ ] repeated callbacks безопасны;
+* [ ] existing functionality не сломана;
 * [ ] бот переживает restart;
 * [ ] SQLite работает;
-* [ ] PostgreSQL совместимость сохранена.
+* [ ] PostgreSQL compatibility сохранена;
+* [ ] syntax checks пройдены;
+* [ ] import checks пройдены;
+* [ ] final UI pass завершён.
+
+---
+
+# 83. Главное правило финального релиза
+
+Новые механики после прохождения основного аудита не добавляются без отдельной причины.
+
+Порядок работы:
+
+```text
+functional audit
+↓
+transaction/idempotency fixes
+↓
+tests
+↓
+cosmetic/UI pass
+↓
+final verification
+```
