@@ -1173,6 +1173,9 @@ DISEASE_SIZE_LOSS_PER_TICK = 0.50
 
 DISEASE_MEDICINE_COST = 500
 
+# Стоимость каждого пропущенного часового тика болезни.
+DISEASE_TICK_COST = 500
+
 VENEREOLOGIST_COST = 5_000
 
 VENEREOLOGIST_CURE_CHANCE = 0.20
@@ -1332,8 +1335,6 @@ ROB_COOLDOWN_SECONDS = 24 * 60 * 60
 """
 Коды предметов.
 
-Фактические записи InventoryItem будут создаваться inventory.py.
-
 Здесь только единый список идентификаторов и правила.
 """
 
@@ -1356,6 +1357,50 @@ CASE_CODES = {
     CASE_RARE,
     CASE_EPIC,
     CASE_LEGENDARY,
+}
+
+
+# Вес наград внутри каждого кейса.
+#
+# Формат:
+#     reward_code, amount, weight
+#
+# Итоговая вероятность рассчитывается по сумме weight.
+CASE_REWARDS = {
+    CASE_BASIC: (
+        ("peanuts", 100, 45),
+        ("peanuts", 250, 30),
+        ("item:condom", 1, 15),
+        ("item:lubricant", 1, 8),
+        ("item:dildo", 1, 2),
+    ),
+
+    CASE_RARE: (
+        ("peanuts", 500, 40),
+        ("peanuts", 1000, 25),
+        ("item:condom", 2, 12),
+        ("item:lubricant", 2, 10),
+        ("item:dildo", 1, 8),
+        ("item:rubber_pussy", 1, 5),
+    ),
+
+    CASE_EPIC: (
+        ("peanuts", 2500, 35),
+        ("peanuts", 5000, 25),
+        ("item:dildo", 1, 12),
+        ("item:rubber_pussy", 1, 10),
+        ("item:silicone_implant", 1, 8),
+        ("tag:living_legend", 1, 2),
+    ),
+
+    CASE_LEGENDARY: (
+        ("peanuts", 10000, 30),
+        ("peanuts", 25000, 25),
+        ("item:rubber_pussy", 1, 15),
+        ("item:silicone_implant", 1, 15),
+        ("item:dildo", 1, 10),
+        ("tag:living_legend", 1, 5),
+    ),
 }
 
 
@@ -1710,6 +1755,30 @@ TICTACTOE_MIN_BET = 10
 TICTACTOE_WIN_MULTIPLIER = 2.0
 
 TICTACTOE_DRAW_REFUND = True
+
+
+# ============================================================================
+# BLACKJACK
+# ============================================================================
+
+BLACKJACK_MIN_BET = 10
+
+BLACKJACK_WIN_MULTIPLIER = 2.0
+
+BLACKJACK_NATURAL_MULTIPLIER = 2.5
+
+BLACKJACK_DRAW_REFUND = True
+
+
+# ============================================================================
+# CRASH
+# ============================================================================
+
+CRASH_MIN_BET = 10
+
+CRASH_MIN_MULTIPLIER = 1.10
+
+CRASH_MAX_MULTIPLIER = 10.0
 
 
 # ============================================================================
