@@ -6,10 +6,11 @@ handlers.py — Telegram handlers.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from html import escape
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from aiogram import F, Router
 from aiogram.enums import ChatType
@@ -19,7 +20,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 from sqlalchemy import select
@@ -65,7 +68,6 @@ from services import (
     format_other_profile,
     format_profile,
     format_stats,
-    get_game_list,
     get_leaderboard,
     get_tag_keyboard,
     get_warnings,
@@ -91,7 +93,6 @@ from services import (
     play_guess,
     play_roulette,
     play_slots,
-    purge_messages,
     remove_staff_role,
     remove_warning,
     rob_user,
@@ -111,8 +112,36 @@ router = Router(name="main")
 
 
 # ============================================================================
-# GENERAL
+# UI / MESSAGE CLEANUP
 # ============================================================================
+
+GROUP_BOT_MESSAGE_TTL = 30
+GROUP_COMMAND_TTL = 5
+PRIVATE_BOT_MESSAGE_TTL = 0
+
+NAV_PROFILE = "👤 Профиль"
+NAV_STATS = "📊 Стата"
+NAV_BALANCE = "🥜 Баланс"
+NAV_INVENTORY = "🎒 Инвентарь"
+NAV_GAMES = "🎮 Игры"
+NAV_TOP = "🏆 Топ"
+NAV_SIZE_TOP = "📏 Топ размера"
+NAV_BONUS = "🎁 Бонус"
+NAV_BP = "🏅 Battle Pass"
+NAV_TAG = "🏷 Теги"
+
+NAVIGATION_BUTTONS = {
+    NAV_PROFILE,
+    NAV_STATS,
+    NAV_BALANCE,
+    NAV_INVENTORY,
+    NAV_GAMES,
+    NAV_TOP,
+    NAV_SIZE_TOP,
+    NAV_BONUS,
+    NAV_BP,
+    NAV_TAG,
+}
 
 
 def is_group(message: Message) -> bool:
@@ -132,16 +161,170 @@ def parse_integer(value: Optional[str]) -> Optional[int]:
         return None
 
 
+def navigation_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=NAV_PROFILE),
+                KeyboardButton(text=NAV_STATS),
+                KeyboardButton(text=NAV_BALANCE),
+            ],
+            [
+                KeyboardButton(text=NAV_INVENTORY),
+                KeyboardButton(text=NAV_GAMES),
+                KeyboardButton(text=NAV_TOP),
+            ],
+            [
+                KeyboardButton(text=NAV_SIZE_TOP),
+                KeyboardButton(text=NAV_BONUS),
+                KeyboardButton(text=NAV_BP),
+            ],
+            [
+                KeyboardButton(text=NAV_TAG),
+            ],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выбери раздел",
+    )
+
+
+def section_keyboard(
+    *,
+    include_games: bool = True,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="👤 Профиль",
+                callback_data="nav:profile",
+            ),
+            InlineKeyboardButton(
+                text="📊 Стата",
+                callback_data="nav:stats",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🥜 Баланс",
+                callback_data="nav:balance",
+            ),
+            InlineKeyboardButton(
+                text="🎒 Инвентарь",
+                callback_data="nav:inventory",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🏆 Топ",
+                callback_data="nav:top",
+            ),
+            InlineKeyboardButton(
+                text="📏 Размер",
+                callback_data="nav:topsize",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🏅 Battle Pass",
+                callback_data="nav:battlepass",
+            ),
+            InlineKeyboardButton(
+                text="🏷 Теги",
+                callback_data="nav:tag",
+            ),
+        ],
+    ]
+
+    if include_games:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🎮 Игры",
+                    callback_data="nav:games",
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows,
+    )
+
+
+async def safe_delete_message(
+    message: Message,
+) -> None:
+    try:
+        await message.delete()
+    except (
+        TelegramBadRequest,
+        TelegramForbiddenError,
+    ):
+        pass
+    except Exception:
+        logger.debug(
+            "Не удалось удалить сообщение %s:%s.",
+            message.chat.id,
+            message.message_id,
+            exc_info=True,
+        )
+
+
+async def delete_later(
+    message: Message,
+    delay: int | float,
+) -> None:
+    if delay <= 0:
+        return
+
+    try:
+        await asyncio.sleep(delay)
+        await safe_delete_message(message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug(
+            "Ошибка отложенного удаления сообщения %s:%s.",
+            message.chat.id,
+            message.message_id,
+            exc_info=True,
+        )
+
+
+def schedule_delete(
+    message: Optional[Message],
+    delay: int | float,
+) -> None:
+    if message is None or delay <= 0:
+        return
+
+    asyncio.create_task(
+        delete_later(
+            message,
+            delay,
+        )
+    )
+
+
 async def reply(
     message: Message,
     text: str,
+    *,
+    delete_after: Optional[int | float] = None,
+    delete_command: bool = True,
     **kwargs,
 ) -> Optional[Message]:
     if not text:
         return None
 
+    if delete_after is None:
+        delete_after = (
+            GROUP_BOT_MESSAGE_TTL
+            if is_group(message)
+            else PRIVATE_BOT_MESSAGE_TTL
+        )
+
     try:
-        return await message.answer(
+        sent = await message.answer(
             text,
             **kwargs,
         )
@@ -150,14 +333,65 @@ async def reply(
             "Telegram запретил отправку сообщения chat_id=%s",
             message.chat.id,
         )
+        return None
     except TelegramBadRequest:
         logger.exception(
             "Telegram отклонил сообщение chat_id=%s",
             message.chat.id,
         )
+        return None
 
-    return None
+    if delete_after:
+        schedule_delete(
+            sent,
+            delete_after,
+        )
 
+    if (
+        delete_command
+        and is_group(message)
+        and message.message_id
+    ):
+        schedule_delete(
+            message,
+            GROUP_COMMAND_TTL,
+        )
+
+    return sent
+
+
+async def callback_edit(
+    callback: CallbackQuery,
+    text: str,
+    *,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> bool:
+    if not callback.message:
+        return False
+
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=reply_markup,
+        )
+        return True
+    except TelegramBadRequest:
+        return False
+
+
+async def commit_result(
+    session,
+    result: ServiceResult,
+) -> None:
+    if result.success:
+        await session.commit()
+    else:
+        await session.rollback()
+
+
+# ============================================================================
+# MEMBER PREPARATION
+# ============================================================================
 
 async def get_or_prepare_member(
     message: Message,
@@ -193,140 +427,9 @@ async def get_or_prepare_member(
         return member
 
 
-def games_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🪙 Монетка",
-                    callback_data="game:coinflip",
-                ),
-                InlineKeyboardButton(
-                    text="🎲 Кубики",
-                    callback_data="game:dice",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎰 Слоты",
-                    callback_data="game:slots",
-                ),
-                InlineKeyboardButton(
-                    text="🎡 Рулетка",
-                    callback_data="game:roulette",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔢 Угадай число",
-                    callback_data="game:guess",
-                ),
-                InlineKeyboardButton(
-                    text="⚽ Футбол",
-                    callback_data="game:football",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏀 Баскетбол",
-                    callback_data="game:basketball",
-                ),
-                InlineKeyboardButton(
-                    text="⭕❌ TTT",
-                    callback_data="game:tictactoe",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🃏 Blackjack",
-                    callback_data="game:blackjack",
-                ),
-                InlineKeyboardButton(
-                    text="🚀 Crash",
-                    callback_data="game:crash",
-                ),
-            ],
-        ]
-    )
-
-
-def back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Игры",
-                    callback_data="games:menu",
-                )
-            ]
-        ]
-    )
-
-
-async def build_case_keyboard(
-    session,
-    chat_id: int,
-    user_id: int,
-) -> Optional[InlineKeyboardMarkup]:
-    query = await session.execute(
-        select(
-            InventoryItem.code,
-            UserItem.quantity,
-        )
-        .join(
-            UserItem,
-            UserItem.item_id == InventoryItem.id,
-        )
-        .where(
-            UserItem.chat_id == chat_id,
-            UserItem.user_id == user_id,
-            InventoryItem.code.in_(tuple(CASE_REWARDS.keys())),
-            UserItem.quantity > 0,
-        )
-        .order_by(InventoryItem.id.asc())
-    )
-
-    rows = []
-
-    titles = {
-        "basic_case": "📦 Basic Case",
-        "rare_case": "💎 Rare Case",
-        "epic_case": "🔥 Epic Case",
-        "legendary_case": "👑 Legendary Case",
-    }
-
-    for code, quantity in query.all():
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{titles.get(code, code)} ×{quantity}",
-                    callback_data=f"case:{code}",
-                )
-            ]
-        )
-
-    if not rows:
-        return None
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows,
-    )
-
-
-async def commit_result(
-    session,
-    result: ServiceResult,
-) -> None:
-    if result.success:
-        await session.commit()
-    else:
-        await session.rollback()
-
-
 # ============================================================================
 # PROFILE TARGET
 # ============================================================================
-
 
 async def resolve_user_id(
     message: Message,
@@ -388,12 +491,111 @@ def reply_target_id(
 
 
 # ============================================================================
+# CASES
+# ============================================================================
+
+async def build_case_keyboard(
+    session,
+    chat_id: int,
+    user_id: int,
+) -> Optional[InlineKeyboardMarkup]:
+    query = await session.execute(
+        select(
+            InventoryItem.code,
+            UserItem.quantity,
+        )
+        .join(
+            UserItem,
+            UserItem.item_id == InventoryItem.id,
+        )
+        .where(
+            UserItem.chat_id == chat_id,
+            UserItem.user_id == user_id,
+            InventoryItem.code.in_(
+                tuple(CASE_REWARDS.keys())
+            ),
+            UserItem.quantity > 0,
+        )
+        .order_by(
+            InventoryItem.id.asc()
+        )
+    )
+
+    titles = {
+        "basic_case": "📦 Basic Case",
+        "rare_case": "💎 Rare Case",
+        "epic_case": "🔥 Epic Case",
+        "legendary_case": "👑 Legendary Case",
+    }
+
+    rows = []
+
+    for code, quantity in query.all():
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"{titles.get(code, code)} "
+                        f"×{quantity}"
+                    ),
+                    callback_data=f"case:{code}",
+                )
+            ]
+        )
+
+    if not rows:
+        return None
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows,
+    )
+
+
+def inventory_keyboard(
+    case_keyboard: Optional[InlineKeyboardMarkup],
+) -> InlineKeyboardMarkup:
+    rows = []
+
+    if case_keyboard:
+        rows.extend(
+            case_keyboard.inline_keyboard
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🏷 Теги",
+                callback_data="nav:tag",
+            ),
+            InlineKeyboardButton(
+                text="👤 Профиль",
+                callback_data="nav:profile",
+            ),
+        ]
+    )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🎮 Игры",
+                callback_data="nav:games",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows,
+    )
+
+
+# ============================================================================
 # START / HELP
 # ============================================================================
 
-
 @router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(
+    message: Message,
+) -> None:
     await get_or_prepare_member(message)
 
     await reply(
@@ -406,15 +608,18 @@ async def cmd_start(message: Message) -> None:
             "💰 Экономика\n"
             "🏆 Battle Pass\n"
             "🏷 Теги\n"
-            "🎭 RP\n"
-            "🛡 Модерация\n\n"
-            "Используй /help."
+            "🎭 RP\n\n"
+            "Используй нижнее меню."
         ),
+        reply_markup=navigation_keyboard(),
+        delete_after=0,
     )
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
+async def cmd_help(
+    message: Message,
+) -> None:
     await reply(
         message,
         (
@@ -459,7 +664,6 @@ async def cmd_help(message: Message) -> None:
             "/ban\n"
             "/unban\n"
             "/kick\n"
-            "/purge\n"
             "/setnick\n"
             "/setrole\n"
             "/delrole\n"
@@ -469,6 +673,7 @@ async def cmd_help(message: Message) -> None:
             "/giveaway_join ID\n"
             "/giveaway_finish ID"
         ),
+        delete_after=60,
     )
 
 
@@ -476,42 +681,72 @@ async def cmd_help(message: Message) -> None:
 # PROFILE
 # ============================================================================
 
-
 def profile_keyboard(
     member,
-) -> Optional[InlineKeyboardMarkup]:
-    buttons = []
+) -> InlineKeyboardMarkup:
+    rows = []
 
     if member.has_disease:
-        buttons.append(
+        rows.append(
             [
                 InlineKeyboardButton(
                     text="💊 Лекарство",
-                    callback_data=f"profile:medicine:{member.user_id}",
+                    callback_data=(
+                        f"profile:medicine:{member.user_id}"
+                    ),
                 ),
                 InlineKeyboardButton(
                     text="🧑‍⚕️ Венеролог",
-                    callback_data=f"profile:venereologist:{member.user_id}",
+                    callback_data=(
+                        f"profile:venereologist:{member.user_id}"
+                    ),
                 ),
             ]
         )
 
     if member.has_child:
-        buttons.append(
+        rows.append(
             [
                 InlineKeyboardButton(
                     text="🏥 Аборт",
-                    callback_data=f"profile:abort:{member.user_id}",
+                    callback_data=(
+                        f"profile:abort:{member.user_id}"
+                    ),
                 )
             ]
         )
 
-    if not buttons:
-        return None
+    rows.extend(
+        section_keyboard().inline_keyboard
+    )
 
     return InlineKeyboardMarkup(
-        inline_keyboard=buttons,
+        inline_keyboard=rows
     )
+
+
+async def render_profile(
+    session,
+    chat_id: int,
+    user_id: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    text = await format_profile(
+        session=session,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+
+    member = await get_or_create_member(
+        session=session,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+
+    keyboard = profile_keyboard(member)
+
+    await session.commit()
+
+    return text, keyboard
 
 
 @router.message(Command("profile"))
@@ -538,19 +773,11 @@ async def cmd_profile(
 
     async with AsyncSessionLocal() as session:
         if target_id == message.from_user.id:
-            text = await format_profile(
-                session=session,
-                chat_id=message.chat.id,
-                user_id=target_id,
+            text, keyboard = await render_profile(
+                session,
+                message.chat.id,
+                target_id,
             )
-
-            member = await get_or_create_member(
-                session=session,
-                chat_id=message.chat.id,
-                user_id=target_id,
-            )
-
-            keyboard = profile_keyboard(member)
         else:
             text = await format_other_profile(
                 session=session,
@@ -558,12 +785,17 @@ async def cmd_profile(
                 target_user_id=target_id,
             )
 
-            keyboard = None
+            keyboard = section_keyboard(
+                include_games=True
+            )
+
+            await session.commit()
 
     await reply(
         message,
         text,
         reply_markup=keyboard,
+        delete_after=0,
     )
 
 
@@ -593,7 +825,9 @@ async def callback_profile_action(
 
     action = parts[1]
 
-    target_id = parse_integer(parts[2])
+    target_id = parse_integer(
+        parts[2]
+    )
 
     if target_id is None:
         await callback.answer(
@@ -636,42 +870,38 @@ async def callback_profile_action(
             result,
         )
 
-        text = await format_profile(
-            session=session,
-            chat_id=callback.message.chat.id,
-            user_id=target_id,
+        text, keyboard = await render_profile(
+            session,
+            callback.message.chat.id,
+            target_id,
         )
-
-        member = await get_or_create_member(
-            session=session,
-            chat_id=callback.message.chat.id,
-            user_id=target_id,
-        )
-
-        keyboard = profile_keyboard(member)
 
     await callback.answer(
         result.answer or result.message,
         show_alert=result.show_alert,
     )
 
-    try:
-        await callback.message.edit_text(
-            text,
-            reply_markup=keyboard,
-        )
-    except TelegramBadRequest:
-        pass
+    await callback_edit(
+        callback,
+        text,
+        reply_markup=keyboard,
+    )
 
 
 @router.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
+async def cmd_stats(
+    message: Message,
+    command: CommandObject,
+) -> None:
     if not message.from_user:
         return
 
     await get_or_prepare_member(message)
 
-    target_id = await resolve_user_id(message)
+    target_id = await resolve_user_id(
+        message,
+        command,
+    )
 
     if target_id is None:
         return
@@ -683,14 +913,22 @@ async def cmd_stats(message: Message) -> None:
             user_id=target_id,
         )
 
+        keyboard = section_keyboard()
+
+        await session.commit()
+
     await reply(
         message,
         text,
+        reply_markup=keyboard,
+        delete_after=0,
     )
 
 
 @router.message(Command("balance"))
-async def cmd_balance(message: Message) -> None:
+async def cmd_balance(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -703,14 +941,27 @@ async def cmd_balance(message: Message) -> None:
             user_id=message.from_user.id,
         )
 
+        keyboard = section_keyboard(
+            include_games=False
+        )
+
+        await session.commit()
+
     await reply(
         message,
-        f"🥜 Баланс: <b>{format_balance(balance)}</b>",
+        (
+            f"🥜 Баланс: "
+            f"<b>{format_balance(balance)}</b>"
+        ),
+        reply_markup=keyboard,
+        delete_after=0,
     )
 
 
 @router.message(Command("inventory"))
-async def cmd_inventory(message: Message) -> None:
+async def cmd_inventory(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -723,21 +974,30 @@ async def cmd_inventory(message: Message) -> None:
             user_id=message.from_user.id,
         )
 
-        keyboard = await build_case_keyboard(
+        case_keyboard = await build_case_keyboard(
             session=session,
             chat_id=message.chat.id,
             user_id=message.from_user.id,
         )
 
+        keyboard = inventory_keyboard(
+            case_keyboard
+        )
+
+        await session.commit()
+
     await reply(
         message,
         text,
         reply_markup=keyboard,
+        delete_after=0,
     )
 
 
 @router.message(Command("tag"))
-async def cmd_tag(message: Message) -> None:
+async def cmd_tag(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -750,6 +1010,21 @@ async def cmd_tag(message: Message) -> None:
             user_id=message.from_user.id,
         )
 
+        await session.commit()
+
+    rows = list(
+        keyboard.inline_keyboard
+    )
+    rows.extend(
+        section_keyboard(
+            include_games=False
+        ).inline_keyboard
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
     await reply(
         message,
         (
@@ -757,6 +1032,7 @@ async def cmd_tag(message: Message) -> None:
             "Выбери полученный тег:"
         ),
         reply_markup=keyboard,
+        delete_after=0,
     )
 
 
@@ -774,7 +1050,10 @@ async def callback_tag_select(
         return
 
     tag_id = parse_integer(
-        callback.data.split(":", 1)[1]
+        (callback.data or "").split(
+            ":",
+            1,
+        )[1]
     )
 
     if tag_id is None:
@@ -803,22 +1082,41 @@ async def callback_tag_select(
             user_id=callback.from_user.id,
         )
 
+        await session.commit()
+
     await callback.answer(
         result.answer or result.message,
         show_alert=result.show_alert,
     )
 
-    if result.success:
-        try:
-            await callback.message.edit_reply_markup(
-                reply_markup=keyboard,
-            )
-        except TelegramBadRequest:
-            pass
+    if not result.success:
+        return
+
+    rows = list(
+        keyboard.inline_keyboard
+    )
+    rows.extend(
+        section_keyboard(
+            include_games=False
+        ).inline_keyboard
+    )
+
+    await callback_edit(
+        callback,
+        (
+            "🏷 <b>Твои теги</b>\n\n"
+            "Выбери полученный тег:"
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ),
+    )
 
 
 @router.message(Command("battlepass"))
-async def cmd_battlepass(message: Message) -> None:
+async def cmd_battlepass(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -833,7 +1131,10 @@ async def cmd_battlepass(message: Message) -> None:
 
         level = min(
             BATTLE_PASS_MAX_LEVEL,
-            max(1, member.battle_pass_level),
+            max(
+                1,
+                member.battle_pass_level,
+            ),
         )
 
         current_xp = member.battle_pass_xp
@@ -870,21 +1171,31 @@ async def cmd_battlepass(message: Message) -> None:
                 or reward
             )
 
+        await session.commit()
+
     await reply(
         message,
         (
             "<b>🏆 Battle Pass</b>\n\n"
-            f"Уровень: <b>{level}/{BATTLE_PASS_MAX_LEVEL}</b>\n"
+            f"Уровень: "
+            f"<b>{level}/{BATTLE_PASS_MAX_LEVEL}</b>\n"
             f"XP сезона: <b>{current_xp}</b>\n"
-            f"До следующего уровня: <b>{remaining}</b>\n\n"
+            f"До следующего уровня: "
+            f"<b>{remaining}</b>\n\n"
             f"🎁 Награда текущего уровня:\n"
             f"{escape(reward_text)}"
         ),
+        reply_markup=section_keyboard(
+            include_games=False
+        ),
+        delete_after=0,
     )
 
 
 @router.message(Command("top"))
-async def cmd_top(message: Message) -> None:
+async def cmd_top(
+    message: Message,
+) -> None:
     if not is_group(message):
         await reply(
             message,
@@ -898,14 +1209,22 @@ async def cmd_top(message: Message) -> None:
             chat_id=message.chat.id,
         )
 
+        await session.commit()
+
     await reply(
         message,
         text,
+        reply_markup=section_keyboard(
+            include_games=False
+        ),
+        delete_after=0,
     )
 
 
 @router.message(Command("topsize"))
-async def cmd_topsize(message: Message) -> None:
+async def cmd_topsize(
+    message: Message,
+) -> None:
     if not is_group(message):
         await reply(
             message,
@@ -935,14 +1254,22 @@ async def cmd_topsize(message: Message) -> None:
                 f"<b>{member.penis_size:.2f} см</b>"
             )
 
+        await session.commit()
+
     await reply(
         message,
         "\n".join(lines),
+        reply_markup=section_keyboard(
+            include_games=False
+        ),
+        delete_after=0,
     )
 
 
 @router.message(Command("bonus"))
-async def cmd_bonus(message: Message) -> None:
+async def cmd_bonus(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -963,13 +1290,255 @@ async def cmd_bonus(message: Message) -> None:
     await reply(
         message,
         result.message,
+        reply_markup=section_keyboard(
+            include_games=False
+        ),
+        delete_after=20,
     )
+
+
+# ============================================================================
+# BOTTOM NAVIGATION
+# ============================================================================
+
+async def _nav_profile(
+    message: Message,
+) -> None:
+    if not message.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        text, keyboard = await render_profile(
+            session,
+            message.chat.id,
+            message.from_user.id,
+        )
+
+    await reply(
+        message,
+        text,
+        reply_markup=keyboard,
+        delete_after=0,
+    )
+
+
+async def _nav_stats(
+    message: Message,
+) -> None:
+    if not message.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        text = await format_stats(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+        keyboard = section_keyboard()
+        await session.commit()
+
+    await reply(
+        message,
+        text,
+        reply_markup=keyboard,
+        delete_after=0,
+    )
+
+
+async def _nav_balance(
+    message: Message,
+) -> None:
+    if not message.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        balance = await balance_user(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+        await session.commit()
+
+    await reply(
+        message,
+        f"🥜 Баланс: <b>{format_balance(balance)}</b>",
+        reply_markup=section_keyboard(
+            include_games=False
+        ),
+        delete_after=0,
+    )
+
+
+async def _nav_inventory(
+    message: Message,
+) -> None:
+    if not message.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        text = await format_inventory(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+
+        case_keyboard = await build_case_keyboard(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+
+        await session.commit()
+
+    await reply(
+        message,
+        text,
+        reply_markup=inventory_keyboard(
+            case_keyboard
+        ),
+        delete_after=0,
+    )
+
+
+async def _nav_tag(
+    message: Message,
+) -> None:
+    if not message.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        keyboard = await get_tag_keyboard(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+        )
+        await session.commit()
+
+    rows = list(
+        keyboard.inline_keyboard
+    )
+    rows.extend(
+        section_keyboard(
+            include_games=False
+        ).inline_keyboard
+    )
+
+    await reply(
+        message,
+        (
+            "🏷 <b>Твои теги</b>\n\n"
+            "Выбери полученный тег:"
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ),
+        delete_after=0,
+    )
+
+
+async def _nav_battlepass(
+    message: Message,
+) -> None:
+    await cmd_battlepass(message)
+
+
+async def _nav_games(
+    message: Message,
+) -> None:
+    await cmd_games(message)
+
+
+async def _nav_top(
+    message: Message,
+) -> None:
+    await cmd_top(message)
+
+
+async def _nav_topsize(
+    message: Message,
+) -> None:
+    await cmd_topsize(message)
+
+
+async def _nav_bonus(
+    message: Message,
+) -> None:
+    await cmd_bonus(message)
+
+
+@router.message(F.text == NAV_PROFILE)
+async def nav_profile_handler(
+    message: Message,
+) -> None:
+    await _nav_profile(message)
+
+
+@router.message(F.text == NAV_STATS)
+async def nav_stats_handler(
+    message: Message,
+) -> None:
+    await _nav_stats(message)
+
+
+@router.message(F.text == NAV_BALANCE)
+async def nav_balance_handler(
+    message: Message,
+) -> None:
+    await _nav_balance(message)
+
+
+@router.message(F.text == NAV_INVENTORY)
+async def nav_inventory_handler(
+    message: Message,
+) -> None:
+    await _nav_inventory(message)
+
+
+@router.message(F.text == NAV_GAMES)
+async def nav_games_handler(
+    message: Message,
+) -> None:
+    await _nav_games(message)
+
+
+@router.message(F.text == NAV_TOP)
+async def nav_top_handler(
+    message: Message,
+) -> None:
+    await _nav_top(message)
+
+
+@router.message(F.text == NAV_SIZE_TOP)
+async def nav_size_top_handler(
+    message: Message,
+) -> None:
+    await _nav_topsize(message)
+
+
+@router.message(F.text == NAV_BONUS)
+async def nav_bonus_handler(
+    message: Message,
+) -> None:
+    await _nav_bonus(message)
+
+
+@router.message(F.text == NAV_BP)
+async def nav_bp_handler(
+    message: Message,
+) -> None:
+    await _nav_battlepass(message)
+
+
+@router.message(F.text == NAV_TAG)
+async def nav_tag_handler(
+    message: Message,
+) -> None:
+    await _nav_tag(message)
 
 
 # ============================================================================
 # ECONOMY
 # ============================================================================
-
 
 @router.message(Command("pay"))
 async def cmd_pay(
@@ -983,7 +1552,8 @@ async def cmd_pay(
         await reply(
             message,
             (
-                "💸 Используй /pay ответом на сообщение.\n"
+                "💸 Используй /pay ответом "
+                "на сообщение.\n"
                 "Пример: <code>/pay 500</code>"
             ),
         )
@@ -1026,7 +1596,9 @@ async def cmd_pay(
 
 
 @router.message(Command("masturbate"))
-async def cmd_masturbate(message: Message) -> None:
+async def cmd_masturbate(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
@@ -1049,14 +1621,17 @@ async def cmd_masturbate(message: Message) -> None:
 
 
 @router.message(Command("rob"))
-async def cmd_rob(message: Message) -> None:
+async def cmd_rob(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
     if not message.reply_to_message:
         await reply(
             message,
-            "🥷 Используй /rob ответом на сообщение цели.",
+            "🥷 Используй /rob ответом "
+            "на сообщение цели.",
         )
         return
 
@@ -1088,9 +1663,311 @@ async def cmd_rob(message: Message) -> None:
 # GAMES
 # ============================================================================
 
+GAME_TITLES = {
+    "coinflip": "🪙 Монетка",
+    "dice": "🎲 Кубики",
+    "slots": "🎰 Слоты",
+    "roulette": "🎡 Рулетка",
+    "guess": "🔢 Угадай число",
+    "football": "⚽ Футбол",
+    "basketball": "🏀 Баскетбол",
+    "tictactoe": "⭕❌ Крестики-нолики",
+    "blackjack": "🃏 Blackjack",
+    "crash": "🚀 Crash",
+}
+
+GAME_CALLBACKS = {
+    "coinflip": play_coinflip,
+    "dice": play_dice,
+    "slots": play_slots,
+    "football": play_football,
+    "basketball": play_basketball,
+    "blackjack": play_blackjack,
+}
+
+
+def games_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+
+    game_rows = [
+        ("coinflip", "🪙 Монетка"),
+        ("dice", "🎲 Кубики"),
+        ("slots", "🎰 Слоты"),
+        ("roulette", "🎡 Рулетка"),
+        ("guess", "🔢 Угадай число"),
+        ("football", "⚽ Футбол"),
+        ("basketball", "🏀 Баскетбол"),
+        ("tictactoe", "⭕❌ TTT"),
+        ("blackjack", "🃏 Blackjack"),
+        ("crash", "🚀 Crash"),
+    ]
+
+    for index in range(0, len(game_rows), 2):
+        first = game_rows[index]
+        second = (
+            game_rows[index + 1]
+            if index + 1 < len(game_rows)
+            else None
+        )
+
+        row = [
+            InlineKeyboardButton(
+                text=first[1],
+                callback_data=f"game:{first[0]}",
+            )
+        ]
+
+        if second:
+            row.append(
+                InlineKeyboardButton(
+                    text=second[1],
+                    callback_data=f"game:{second[0]}",
+                )
+            )
+
+        rows.append(row)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="👤 Профиль",
+                callback_data="nav:profile",
+            ),
+            InlineKeyboardButton(
+                text="🥜 Баланс",
+                callback_data="nav:balance",
+            ),
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def game_bet_keyboard(
+    game_type: str,
+) -> InlineKeyboardMarkup:
+    bets = [10, 50, 100, 500, 1_000]
+
+    rows = []
+
+    for index in range(0, len(bets), 3):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🥜 {bet}",
+                    callback_data=(
+                        f"gamebet:{game_type}:{bet}"
+                    ),
+                )
+                for bet in bets[index:index + 3]
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Игры",
+                callback_data="games:menu",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def roulette_bet_keyboard(
+    bet: int,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔴 Красное",
+                    callback_data=f"gameroulette:{bet}:red",
+                ),
+                InlineKeyboardButton(
+                    text="⚫ Чёрное",
+                    callback_data=f"gameroulette:{bet}:black",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🟢 Зеро",
+                    callback_data=f"gameroulette:{bet}:green",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="game:roulette",
+                )
+            ],
+        ]
+    )
+
+
+def guess_keyboard(
+    bet: int,
+) -> InlineKeyboardMarkup:
+    rows = []
+
+    for start in range(1, 11, 5):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=str(number),
+                    callback_data=(
+                        f"gameguess:{bet}:{number}"
+                    ),
+                )
+                for number in range(
+                    start,
+                    min(start + 5, 11),
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Игры",
+                callback_data="games:menu",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def crash_keyboard(
+    bet: int,
+) -> InlineKeyboardMarkup:
+    multipliers = [
+        "1.10",
+        "1.50",
+        "2.00",
+        "3.00",
+        "5.00",
+        "10.00",
+    ]
+
+    rows = []
+
+    for index in range(0, len(multipliers), 3):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{value}x",
+                    callback_data=(
+                        f"gamecrash:{bet}:{value}"
+                    ),
+                )
+                for value in multipliers[index:index + 3]
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Игры",
+                callback_data="games:menu",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def ttt_start_keyboard() -> InlineKeyboardMarkup:
+    bets = [10, 50, 100, 500]
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🥜 {bet}",
+                    callback_data=f"gamettt:{bet}",
+                )
+                for bet in bets
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Игры",
+                    callback_data="games:menu",
+                )
+            ],
+        ]
+    )
+
+
+async def execute_simple_game(
+    callback: CallbackQuery,
+    game_type: str,
+    bet: int,
+) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    handler = GAME_CALLBACKS.get(game_type)
+
+    if handler is None:
+        await callback.answer(
+            "Эта игра требует дополнительного выбора.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await handler(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            bet=bet,
+        )
+
+        await commit_result(
+            session,
+            result,
+        )
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
+
+    if result.success:
+        await callback_edit(
+            callback,
+            (
+                result.message
+                + "\n\n🎮 <i>Можно сыграть ещё раз.</i>"
+            ),
+            reply_markup=game_bet_keyboard(game_type),
+        )
+    else:
+        await callback_edit(
+            callback,
+            (
+                f"<b>{GAME_TITLES.get(game_type, 'Игра')}</b>\n\n"
+                f"{result.message}"
+            ),
+            reply_markup=game_bet_keyboard(game_type),
+        )
+
 
 @router.message(Command("games"))
-async def cmd_games(message: Message) -> None:
+async def cmd_games(
+    message: Message,
+) -> None:
     await reply(
         message,
         (
@@ -1098,6 +1975,7 @@ async def cmd_games(message: Message) -> None:
             "Выбери игру:"
         ),
         reply_markup=games_keyboard(),
+        delete_after=0,
     )
 
 
@@ -1109,7 +1987,9 @@ async def cmd_coinflip(
     if not message.from_user:
         return
 
-    bet = parse_integer(command.args)
+    bet = parse_integer(
+        command.args
+    )
 
     if bet is None:
         await reply(
@@ -1145,7 +2025,9 @@ async def cmd_dice(
     if not message.from_user:
         return
 
-    bet = parse_integer(command.args)
+    bet = parse_integer(
+        command.args
+    )
 
     if bet is None:
         await reply(
@@ -1181,7 +2063,9 @@ async def cmd_slots(
     if not message.from_user:
         return
 
-    bet = parse_integer(command.args)
+    bet = parse_integer(
+        command.args
+    )
 
     if bet is None:
         await reply(
@@ -1314,7 +2198,9 @@ async def cmd_football(
     if not message.from_user:
         return
 
-    bet = parse_integer(command.args)
+    bet = parse_integer(
+        command.args
+    )
 
     if bet is None:
         await reply(
@@ -1350,7 +2236,9 @@ async def cmd_basketball(
     if not message.from_user:
         return
 
-    bet = parse_integer(command.args)
+    bet = parse_integer(
+        command.args
+    )
 
     if bet is None:
         await reply(
@@ -1386,7 +2274,9 @@ async def cmd_blackjack(
     if not message.from_user:
         return
 
-    bet = parse_integer(command.args)
+    bet = parse_integer(
+        command.args
+    )
 
     if bet is None:
         await reply(
@@ -1475,15 +2365,291 @@ async def cmd_crash(
 
 
 @router.message(Command("ttt"))
-async def cmd_ttt(message: Message) -> None:
+async def cmd_ttt(
+    message: Message,
+) -> None:
     if not message.from_user:
         return
 
+    await reply(
+        message,
+        (
+            "⭕❌ <b>Крестики-нолики</b>\n\n"
+            "Выбери ставку:"
+        ),
+        reply_markup=ttt_start_keyboard(),
+        delete_after=0,
+    )
+
+
+@router.callback_query(
+    F.data.startswith("game:")
+)
+async def callback_game(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
+        await callback.answer()
+        return
+
+    game_type = (
+        callback.data or ""
+    ).split(
+        ":",
+        1,
+    )[1]
+
+    if game_type not in GAME_TITLES:
+        await callback.answer(
+            "Неизвестная игра.",
+            show_alert=True,
+        )
+        return
+
     async with AsyncSessionLocal() as session:
-        result = await start_tictactoe(
+        member = await get_or_create_member(
             session=session,
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
+        if not game_unlocked(
+            member,
+            game_type,
+        ):
+            required = get_feature_required_level(
+                game_type
+            )
+
+            await callback.answer(
+                (
+                    f"🔒 Игра открывается на "
+                    f"<b>{required}</b> уровне.\n"
+                    f"Твой уровень: <b>{member.level}</b>."
+                ),
+                show_alert=True,
+            )
+            return
+
+    if game_type == "roulette":
+        await callback.answer()
+
+        await callback_edit(
+            callback,
+            (
+                "<b>🎡 Рулетка</b>\n\n"
+                "Сначала выбери ставку:"
+            ),
+            reply_markup=game_bet_keyboard(
+                "roulette"
+            ),
+        )
+        return
+
+    if game_type == "guess":
+        await callback.answer()
+
+        await callback_edit(
+            callback,
+            (
+                "<b>🔢 Угадай число</b>\n\n"
+                "Сначала выбери ставку:"
+            ),
+            reply_markup=game_bet_keyboard(
+                "guess"
+            ),
+        )
+        return
+
+    if game_type == "crash":
+        await callback.answer()
+
+        await callback_edit(
+            callback,
+            (
+                "<b>🚀 Crash</b>\n\n"
+                "Сначала выбери ставку:"
+            ),
+            reply_markup=game_bet_keyboard(
+                "crash"
+            ),
+        )
+        return
+
+    if game_type == "tictactoe":
+        await callback.answer()
+
+        await callback_edit(
+            callback,
+            (
+                "⭕❌ <b>Крестики-нолики</b>\n\n"
+                "Выбери ставку:"
+            ),
+            reply_markup=ttt_start_keyboard(),
+        )
+        return
+
+    await callback.answer()
+
+    await callback_edit(
+        callback,
+        (
+            f"<b>{GAME_TITLES[game_type]}</b>\n\n"
+            "Выбери ставку:"
+        ),
+        reply_markup=game_bet_keyboard(
+            game_type
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("gamebet:")
+)
+async def callback_game_bet(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
+        await callback.answer()
+        return
+
+    parts = (
+        callback.data or ""
+    ).split(":")
+    
+    if len(parts) != 3:
+        await callback.answer(
+            "Некорректная ставка.",
+            show_alert=True,
+        )
+        return
+
+    game_type = parts[1]
+    bet = parse_integer(parts[2])
+
+    if game_type not in GAME_TITLES or bet is None:
+        await callback.answer(
+            "Некорректная игра или ставка.",
+            show_alert=True,
+        )
+        return
+
+    if game_type == "roulette":
+        await callback.answer()
+
+        await callback_edit(
+            callback,
+            (
+                "<b>🎡 Рулетка</b>\n\n"
+                f"Ставка: <b>{format_balance(bet)}</b> 🥜\n"
+                "Выбери цвет:"
+            ),
+            reply_markup=roulette_bet_keyboard(
+                bet
+            ),
+        )
+        return
+
+    if game_type == "guess":
+        await callback.answer()
+
+        await callback_edit(
+            callback,
+            (
+                "<b>🔢 Угадай число</b>\n\n"
+                f"Ставка: <b>{format_balance(bet)}</b> 🥜\n"
+                "Выбери число:"
+            ),
+            reply_markup=guess_keyboard(
+                bet
+            ),
+        )
+        return
+
+    if game_type == "crash":
+        await callback.answer()
+
+        await callback_edit(
+            callback,
+            (
+                "<b>🚀 Crash</b>\n\n"
+                f"Ставка: <b>{format_balance(bet)}</b> 🥜\n"
+                "Выбери точку вывода:"
+            ),
+            reply_markup=crash_keyboard(
+                bet
+            ),
+        )
+        return
+
+    if game_type == "tictactoe":
+        await callback.answer(
+            "Выбери ставку в меню TTT.",
+            show_alert=True,
+        )
+        return
+
+    await execute_simple_game(
+        callback,
+        game_type,
+        bet,
+    )
+
+
+@router.callback_query(
+    F.data.startswith("gameroulette:")
+)
+async def callback_game_roulette(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
+        await callback.answer()
+        return
+
+    parts = (
+        callback.data or ""
+    ).split(":")
+    
+    if len(parts) != 3:
+        await callback.answer(
+            "Некорректная ставка.",
+            show_alert=True,
+        )
+        return
+
+    bet = parse_integer(parts[1])
+    choice = parts[2].lower()
+
+    if (
+        bet is None
+        or choice not in {
+            "red",
+            "black",
+            "green",
+        }
+    ):
+        await callback.answer(
+            "Некорректный выбор.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await play_roulette(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            bet=bet,
+            choice=choice,
         )
 
         await commit_result(
@@ -1491,11 +2657,221 @@ async def cmd_ttt(message: Message) -> None:
             result,
         )
 
-    await reply(
-        message,
-        result.message,
-        reply_markup=result.keyboard,
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
     )
+
+    if result.success:
+        await callback_edit(
+            callback,
+            (
+                result.message
+                + "\n\n🎡 <i>Ещё одна ставка?</i>"
+            ),
+            reply_markup=game_bet_keyboard(
+                "roulette"
+            ),
+        )
+    else:
+        await callback_edit(
+            callback,
+            result.message,
+            reply_markup=roulette_bet_keyboard(
+                bet
+            ),
+        )
+
+
+@router.callback_query(
+    F.data.startswith("gameguess:")
+)
+async def callback_game_guess(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
+        await callback.answer()
+        return
+
+    parts = (
+        callback.data or ""
+    ).split(":")
+    
+    if len(parts) != 3:
+        await callback.answer(
+            "Некорректный выбор.",
+            show_alert=True,
+        )
+        return
+
+    bet = parse_integer(parts[1])
+    number = parse_integer(parts[2])
+
+    if (
+        bet is None
+        or number is None
+        or not 1 <= number <= 10
+    ):
+        await callback.answer(
+            "Некорректный выбор.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await play_guess(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            bet=bet,
+            number=number,
+        )
+
+        await commit_result(
+            session,
+            result,
+        )
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
+
+    await callback_edit(
+        callback,
+        result.message,
+        reply_markup=game_bet_keyboard(
+            "guess"
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("gamecrash:")
+)
+async def callback_game_crash(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
+        await callback.answer()
+        return
+
+    parts = (
+        callback.data or ""
+    ).split(":")
+    
+    if len(parts) != 3:
+        await callback.answer(
+            "Некорректный выбор.",
+            show_alert=True,
+        )
+        return
+
+    bet = parse_integer(parts[1])
+
+    try:
+        multiplier = float(parts[2])
+    except (TypeError, ValueError):
+        multiplier = 0.0
+
+    if bet is None:
+        await callback.answer(
+            "Некорректная ставка.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await play_crash(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            bet=bet,
+            cashout_multiplier=multiplier,
+        )
+
+        await commit_result(
+            session,
+            result,
+        )
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
+
+    await callback_edit(
+        callback,
+        result.message,
+        reply_markup=game_bet_keyboard(
+            "crash"
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("gamettt:")
+)
+async def callback_ttt_start(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
+        await callback.answer()
+        return
+
+    bet = parse_integer(
+        (callback.data or "").split(
+            ":",
+            1,
+        )[1]
+    )
+
+    if bet is None:
+        await callback.answer(
+            "Некорректная ставка.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await start_tictactoe(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            bet=bet,
+        )
+
+        await commit_result(
+            session,
+            result,
+        )
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
+
+    if result.success:
+        await callback_edit(
+            callback,
+            result.message,
+            reply_markup=result.keyboard,
+        )
+    else:
+        await callback_edit(
+            callback,
+            result.message,
+            reply_markup=ttt_start_keyboard(),
+        )
 
 
 @router.callback_query(
@@ -1512,7 +2888,10 @@ async def callback_ttt_join(
         return
 
     game_id = parse_integer(
-        (callback.data or "").split(":", 1)[1]
+        (callback.data or "").split(
+            ":",
+            1,
+        )[1]
     )
 
     if game_id is None:
@@ -1540,13 +2919,11 @@ async def callback_ttt_join(
     )
 
     if result.success:
-        try:
-            await callback.message.edit_text(
-                result.message,
-                reply_markup=result.keyboard,
-            )
-        except TelegramBadRequest:
-            pass
+        await callback_edit(
+            callback,
+            result.message,
+            reply_markup=result.keyboard,
+        )
 
 
 @router.callback_query(
@@ -1565,7 +2942,7 @@ async def callback_ttt_move(
     parts = (
         callback.data or ""
     ).split(":")
-
+    
     if len(parts) != 3:
         await callback.answer(
             "Некорректный ход.",
@@ -1602,13 +2979,11 @@ async def callback_ttt_move(
     )
 
     if result.success:
-        try:
-            await callback.message.edit_text(
-                result.message,
-                reply_markup=result.keyboard,
-            )
-        except TelegramBadRequest:
-            pass
+        await callback_edit(
+            callback,
+            result.message,
+            reply_markup=result.keyboard,
+        )
 
 
 @router.callback_query(
@@ -1623,92 +2998,19 @@ async def callback_games_menu(
 
     await callback.answer()
 
-    try:
-        await callback.message.edit_text(
-            (
-                "<b>🎮 Мини-игры</b>\n\n"
-                "Выбери игру:"
-            ),
-            reply_markup=games_keyboard(),
-        )
-    except TelegramBadRequest:
-        pass
-
-
-@router.callback_query(
-    F.data.startswith("game:")
-)
-async def callback_game(
-    callback: CallbackQuery,
-) -> None:
-    if (
-        not callback.message
-        or not callback.from_user
-    ):
-        await callback.answer()
-        return
-
-    game_type = (
-        callback.data or ""
-    ).split(":", 1)[1]
-
-    required = get_feature_required_level(
-        game_type
-    )
-
-    async with AsyncSessionLocal() as session:
-        member = await get_or_create_member(
-            session=session,
-            chat_id=callback.message.chat.id,
-            user_id=callback.from_user.id,
-        )
-
-        if not game_unlocked(
-            member,
-            game_type,
-        ):
-            await callback.answer(
-                (
-                    f"🔒 Игра открывается на "
-                    f"<b>{required}</b> уровне.\n"
-                    f"Твой уровень: <b>{member.level}</b>."
-                ),
-                show_alert=True,
-            )
-            return
-
-    instructions = {
-        "coinflip": "🪙 Используй <code>/coinflip 100</code>",
-        "dice": "🎲 Используй <code>/dice 100</code>",
-        "slots": "🎰 Используй <code>/slots 100</code>",
-        "roulette": "🎡 Используй <code>/roulette 100 red</code>",
-        "guess": "🔢 Используй <code>/guess 100 5</code>",
-        "football": "⚽ Используй <code>/football 100</code>",
-        "basketball": "🏀 Используй <code>/basketball 100</code>",
-        "tictactoe": "⭕❌ Используй <code>/ttt</code>",
-        "blackjack": "🃏 Используй <code>/blackjack 100</code>",
-        "crash": "🚀 Используй <code>/crash 100 2.00</code>",
-    }
-
-    text = instructions.get(game_type)
-
-    if text is None:
-        await callback.answer(
-            "Неизвестная игра.",
-            show_alert=True,
-        )
-        return
-
-    await callback.answer(
-        text,
-        show_alert=True,
+    await callback_edit(
+        callback,
+        (
+            "<b>🎮 Мини-игры</b>\n\n"
+            "Выбери игру:"
+        ),
+        reply_markup=games_keyboard(),
     )
 
 
 # ============================================================================
 # RP
 # ============================================================================
-
 
 def parse_rp_text(
     message: Message,
@@ -1795,9 +3097,7 @@ async def execute_rp(
         target_id = None
 
         if message.reply_to_message:
-            target = (
-                message.reply_to_message.from_user
-            )
+            target = message.reply_to_message.from_user
 
             if target:
                 target_id = target.id
@@ -1850,9 +3150,7 @@ async def execute_rp(
     target_id = None
 
     if message.reply_to_message:
-        target = (
-            message.reply_to_message.from_user
-        )
+        target = message.reply_to_message.from_user
 
         if target:
             target_id = target.id
@@ -1900,7 +3198,6 @@ async def execute_rp(
 # MODERATION
 # ============================================================================
 
-
 @router.message(Command("warn"))
 async def cmd_warn(
     message: Message,
@@ -1926,7 +3223,7 @@ async def cmd_warn(
         result = await add_warning(
             session=session,
             chat_id=message.chat.id,
-            user_id=target_id,
+            target_user_id=target_id,
             moderator_id=message.from_user.id,
             reason=reason,
         )
@@ -2026,7 +3323,9 @@ async def cmd_mute(
     ).split()
 
     if args:
-        parsed = parse_integer(args[0])
+        parsed = parse_integer(
+            args[0]
+        )
 
         if parsed is not None:
             duration = parsed
@@ -2211,41 +3510,6 @@ async def cmd_kick(
     )
 
 
-@router.message(Command("purge"))
-async def cmd_purge(
-    message: Message,
-    command: CommandObject,
-) -> None:
-    if not message.from_user:
-        return
-
-    amount = parse_integer(
-        command.args
-    )
-
-    if amount is None:
-        amount = 10
-
-    if not 1 <= amount <= 100:
-        await reply(
-            message,
-            "Количество сообщений должно быть от 1 до 100.",
-        )
-        return
-
-    result = await purge_messages(
-        bot=message.bot,
-        chat_id=message.chat.id,
-        moderator_id=message.from_user.id,
-        count=amount,
-    )
-
-    await reply(
-        message,
-        result.message,
-    )
-
-
 @router.message(Command("setnick"))
 async def cmd_setnick(
     message: Message,
@@ -2335,7 +3599,6 @@ async def cmd_setnick(
 # ============================================================================
 # STAFF ROLES / PERMISSIONS
 # ============================================================================
-
 
 @router.message(Command("setrole"))
 async def cmd_setrole(
@@ -2488,7 +3751,6 @@ async def cmd_setperm(
 # ============================================================================
 # ADMIN ECONOMY
 # ============================================================================
-
 
 @router.message(Command("give"))
 async def cmd_give(
@@ -2709,80 +3971,8 @@ async def cmd_setlevel(
 
 
 # ============================================================================
-# CASES
-# ============================================================================
-
-
-@router.callback_query(
-    F.data.startswith("case:")
-)
-async def callback_case(
-    callback: CallbackQuery,
-) -> None:
-    if (
-        not callback.message
-        or not callback.from_user
-    ):
-        await callback.answer()
-        return
-
-    case_code = (
-        callback.data or ""
-    ).split(":", 1)[1]
-
-    if case_code not in CASE_REWARDS:
-        await callback.answer(
-            "Неизвестный кейс.",
-            show_alert=True,
-        )
-        return
-
-    async with AsyncSessionLocal() as session:
-        result = await open_case(
-            session=session,
-            chat_id=callback.message.chat.id,
-            user_id=callback.from_user.id,
-            case_code=case_code,
-        )
-
-        await commit_result(
-            session,
-            result,
-        )
-
-        inventory_text = await format_inventory(
-            session=session,
-            chat_id=callback.message.chat.id,
-            user_id=callback.from_user.id,
-        )
-
-        keyboard = await build_case_keyboard(
-            session=session,
-            chat_id=callback.message.chat.id,
-            user_id=callback.from_user.id,
-        )
-
-    await callback.answer(
-        result.answer or result.message,
-        show_alert=result.show_alert,
-    )
-
-    try:
-        await callback.message.edit_text(
-            inventory_text,
-            reply_markup=keyboard,
-        )
-    except TelegramBadRequest:
-        await reply(
-            callback.message,
-            result.message,
-        )
-
-
-# ============================================================================
 # GIVEAWAYS
 # ============================================================================
-
 
 @router.message(Command("giveaway"))
 async def cmd_giveaway(
@@ -2914,6 +4104,7 @@ async def cmd_giveaway(
         message,
         result.message,
         reply_markup=result.keyboard,
+        delete_after=0,
     )
 
 
@@ -2933,7 +4124,7 @@ async def callback_giveaway_join(
     parts = (
         callback.data or ""
     ).split(":")
-
+    
     giveaway_id = (
         parse_integer(parts[2])
         if len(parts) == 3
@@ -3056,9 +4247,420 @@ async def cmd_giveaway_finish(
 
 
 # ============================================================================
-# ORDINARY MESSAGE / XP / RP
+# INLINE SECTION NAVIGATION
 # ============================================================================
 
+async def _edit_profile_from_callback(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message or not callback.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        text, keyboard = await render_profile(
+            session,
+            callback.message.chat.id,
+            callback.from_user.id,
+        )
+
+    await callback_edit(
+        callback,
+        text,
+        reply_markup=keyboard,
+    )
+
+
+async def _edit_stats_from_callback(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message or not callback.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        text = await format_stats(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+        await session.commit()
+
+    await callback_edit(
+        callback,
+        text,
+        reply_markup=section_keyboard(),
+    )
+
+
+async def _edit_balance_from_callback(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message or not callback.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        balance = await balance_user(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+        await session.commit()
+
+    await callback_edit(
+        callback,
+        f"🥜 Баланс: <b>{format_balance(balance)}</b>",
+        reply_markup=section_keyboard(
+            include_games=False
+        ),
+    )
+
+
+async def _edit_inventory_from_callback(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message or not callback.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        text = await format_inventory(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
+        case_keyboard = await build_case_keyboard(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
+        await session.commit()
+
+    await callback_edit(
+        callback,
+        text,
+        reply_markup=inventory_keyboard(
+            case_keyboard
+        ),
+    )
+
+
+async def _edit_tag_from_callback(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message or not callback.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        keyboard = await get_tag_keyboard(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+        await session.commit()
+
+    rows = list(
+        keyboard.inline_keyboard
+    )
+    rows.extend(
+        section_keyboard(
+            include_games=False
+        ).inline_keyboard
+    )
+
+    await callback_edit(
+        callback,
+        (
+            "🏷 <b>Твои теги</b>\n\n"
+            "Выбери полученный тег:"
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ),
+    )
+
+
+async def _edit_battlepass_from_callback(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message or not callback.from_user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        member = await get_or_create_member(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
+        level = min(
+            BATTLE_PASS_MAX_LEVEL,
+            max(
+                1,
+                member.battle_pass_level,
+            ),
+        )
+
+        current_xp = member.battle_pass_xp
+        level_xp = current_xp % 100
+
+        remaining = (
+            0
+            if level >= BATTLE_PASS_MAX_LEVEL
+            else 100 - level_xp
+        )
+
+        reward_text = "—"
+
+        reward = BATTLE_PASS_REWARDS.get(level)
+
+        if reward is not None:
+            reward_text = str(
+                getattr(
+                    reward,
+                    "description",
+                    None,
+                )
+                or getattr(
+                    reward,
+                    "name",
+                    None,
+                )
+                or getattr(
+                    reward,
+                    "reward_type",
+                    None,
+                )
+                or reward
+            )
+
+        await session.commit()
+
+    await callback_edit(
+        callback,
+        (
+            "<b>🏆 Battle Pass</b>\n\n"
+            f"Уровень: <b>{level}/{BATTLE_PASS_MAX_LEVEL}</b>\n"
+            f"XP сезона: <b>{current_xp}</b>\n"
+            f"До следующего уровня: <b>{remaining}</b>\n\n"
+            f"🎁 Награда текущего уровня:\n"
+            f"{escape(reward_text)}"
+        ),
+        reply_markup=section_keyboard(
+            include_games=False
+        ),
+    )
+
+
+async def _edit_top_from_callback(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message:
+        return
+
+    if not is_group(callback.message):
+        await callback.answer(
+            "🏆 Рейтинг доступен в группах.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        text = await get_leaderboard(
+            session=session,
+            chat_id=callback.message.chat.id,
+        )
+        await session.commit()
+
+    await callback_edit(
+        callback,
+        text,
+        reply_markup=section_keyboard(
+            include_games=False
+        ),
+    )
+
+
+async def _edit_topsize_from_callback(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message:
+        return
+
+    if not is_group(callback.message):
+        await callback.answer(
+            "📏 Рейтинг доступен в группах.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        members = await get_top_by_penis_size(
+            session=session,
+            chat_id=callback.message.chat.id,
+            limit=10,
+        )
+
+        lines = [
+            "📏 <b>Топ по размеру</b>"
+        ]
+
+        for index, member in enumerate(
+            members,
+            1,
+        ):
+            lines.append(
+                f'{index}. '
+                f'<a href="tg://user?id={member.user_id}">'
+                "Игрок</a> — "
+                f"<b>{member.penis_size:.2f} см</b>"
+            )
+
+        await session.commit()
+
+    await callback_edit(
+        callback,
+        "\n".join(lines),
+        reply_markup=section_keyboard(
+            include_games=False
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("nav:")
+)
+async def callback_navigation(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+
+    action = (
+        callback.data or ""
+    ).split(
+        ":",
+        1,
+    )[1]
+
+    handlers: dict[
+        str,
+        Callable[[CallbackQuery], Awaitable[None]],
+    ] = {
+        "profile": _edit_profile_from_callback,
+        "stats": _edit_stats_from_callback,
+        "balance": _edit_balance_from_callback,
+        "inventory": _edit_inventory_from_callback,
+        "tag": _edit_tag_from_callback,
+        "battlepass": _edit_battlepass_from_callback,
+        "top": _edit_top_from_callback,
+        "topsize": _edit_topsize_from_callback,
+    }
+
+    if action == "games":
+        await callback.answer()
+
+        await callback_edit(
+            callback,
+            (
+                "<b>🎮 Мини-игры</b>\n\n"
+                "Выбери игру:"
+            ),
+            reply_markup=games_keyboard(),
+        )
+        return
+
+    handler = handlers.get(action)
+
+    if handler is None:
+        await callback.answer(
+            "Неизвестный раздел.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+
+    await handler(
+        callback
+    )
+
+
+# ============================================================================
+# CASES CALLBACK
+# ============================================================================
+
+@router.callback_query(
+    F.data.startswith("case:")
+)
+async def callback_case(
+    callback: CallbackQuery,
+) -> None:
+    if (
+        not callback.message
+        or not callback.from_user
+    ):
+        await callback.answer()
+        return
+
+    case_code = (
+        callback.data or ""
+    ).split(
+        ":",
+        1,
+    )[1]
+
+    if case_code not in CASE_REWARDS:
+        await callback.answer(
+            "Неизвестный кейс.",
+            show_alert=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await open_case(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            case_code=case_code,
+        )
+
+        await commit_result(
+            session,
+            result,
+        )
+
+        inventory_text = await format_inventory(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
+        case_keyboard = await build_case_keyboard(
+            session=session,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+        )
+
+        await session.commit()
+
+    await callback.answer(
+        result.answer or result.message,
+        show_alert=result.show_alert,
+    )
+
+    await callback_edit(
+        callback,
+        inventory_text,
+        reply_markup=inventory_keyboard(
+            case_keyboard
+        ),
+    )
+
+
+# ============================================================================
+# ORDINARY MESSAGE / XP / RP
+# ============================================================================
 
 @router.message(F.text)
 async def ordinary_message(
@@ -3078,6 +4680,9 @@ async def ordinary_message(
     ).strip()
 
     if not text:
+        return
+
+    if text in NAVIGATION_BUTTONS:
         return
 
     result = await execute_rp(
@@ -3114,7 +4719,6 @@ async def ordinary_message(
 # GLOBAL ERRORS
 # ============================================================================
 
-
 @router.errors()
 async def global_error_handler(
     event,
@@ -3128,7 +4732,6 @@ async def global_error_handler(
 # ============================================================================
 # REGISTRATION
 # ============================================================================
-
 
 def register_handlers(
     dispatcher,
