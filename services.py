@@ -21,22 +21,31 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core import (
+    ABORT_COST,
+    ABORT_SUCCESS_CHANCE,
     ADULT_RP_COST,
     ADULT_RP_SIZE_GAIN_MAX,
     ADULT_RP_SIZE_GAIN_MIN,
     ADULT_RP_TARGET_SIZE_LOSS_MAX,
     ADULT_RP_TARGET_SIZE_LOSS_MIN,
-    ABORT_COST,
-    ABORT_SUCCESS_CHANCE,
     BATTLE_PASS_MAX_LEVEL,
     BATTLE_PASS_REWARDS,
+    BLACKJACK_DRAW_REFUND,
+    BLACKJACK_MIN_BET,
+    BLACKJACK_NATURAL_MULTIPLIER,
+    BLACKJACK_WIN_MULTIPLIER,
+    CASE_REWARDS,
     CHILD_DURATION_HOURS,
     CHILD_SUPPORT_PER_HOUR,
     CURRENCY_SYMBOL,
+    CRASH_MAX_MULTIPLIER,
+    CRASH_MIN_BET,
+    CRASH_MIN_MULTIPLIER,
     DEFAULT_MODERATION_PERMISSIONS,
     DISEASE_CONTRACT_CHANCE,
     DISEASE_MEDICINE_COST,
     DISEASE_SIZE_LOSS_PER_TICK,
+    DISEASE_TICK_COST,
     DILDO_DUPLICATE_COMPENSATION,
     DILDO_ITEM_CODE,
     DILDO_MAX_OWNED,
@@ -169,7 +178,6 @@ ADULT_RP_COST_VALUE = ADULT_RP_COST
 ROB_COOLDOWN = ROB_COOLDOWN_SECONDS
 
 DISEASE_TICK_INTERVAL = 60 * 60
-DISEASE_TICK_COST = DISEASE_MEDICINE_COST
 
 CHILD_DURATION = CHILD_DURATION_HOURS * 60 * 60
 CHILD_SUPPORT_COST = CHILD_SUPPORT_PER_HOUR
@@ -1213,13 +1221,6 @@ async def format_profile(
     disease_text = ""
 
     if member.has_disease:
-        disease_remaining = cooldown_remaining(
-            member.last_disease_check_at
-            if hasattr(member, "last_disease_check_at")
-            else None,
-            DISEASE_TICK_INTERVAL,
-        )
-
         next_tick_text = ""
 
         if member.next_disease_tick is not None:
@@ -2143,6 +2144,389 @@ async def play_basketball(
     )
 
 
+# ============================================================================
+# BLACKJACK
+# ============================================================================
+
+def _blackjack_card_value(rank: str) -> int:
+    if rank in {"J", "Q", "K"}:
+        return 10
+
+    if rank == "A":
+        return 11
+
+    return int(rank)
+
+
+def _blackjack_hand_value(hand: list[str]) -> int:
+    total = sum(
+        _blackjack_card_value(card[:-1])
+        for card in hand
+    )
+
+    aces = sum(
+        1
+        for card in hand
+        if card[:-1] == "A"
+    )
+
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+
+    return total
+
+
+def _blackjack_card_text(card: str) -> str:
+    rank = card[:-1]
+    suit = card[-1]
+
+    suit_text = {
+        "♠": "♠",
+        "♥": "♥",
+        "♦": "♦",
+        "♣": "♣",
+    }
+
+    return f"{rank}{suit_text.get(suit, suit)}"
+
+
+async def play_blackjack(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+    bet: int,
+) -> ServiceResult:
+    if bet < BLACKJACK_MIN_BET:
+        return ServiceResult(
+            False,
+            (
+                "❌ Минимальная ставка Blackjack — "
+                f"<b>{format_balance(BLACKJACK_MIN_BET)}</b> 🥜."
+            ),
+        )
+
+    _, error = await prepare_game(
+        session,
+        chat_id,
+        user_id,
+        "blackjack",
+        bet,
+    )
+
+    if error:
+        return error
+
+    ranks = [
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "J",
+        "Q",
+        "K",
+        "A",
+    ]
+
+    suits = [
+        "♠",
+        "♥",
+        "♦",
+        "♣",
+    ]
+
+    deck = [
+        f"{rank}{suit}"
+        for rank in ranks
+        for suit in suits
+    ]
+
+    RNG.shuffle(deck)
+
+    player = [
+        deck.pop(),
+        deck.pop(),
+    ]
+
+    dealer = [
+        deck.pop(),
+        deck.pop(),
+    ]
+
+    player_total = _blackjack_hand_value(player)
+    dealer_total = _blackjack_hand_value(dealer)
+
+    player_natural = (
+        len(player) == 2
+        and player_total == 21
+    )
+
+    dealer_natural = (
+        len(dealer) == 2
+        and dealer_total == 21
+    )
+
+    while (
+        player_total < 17
+        and player_total <= 21
+    ):
+        player.append(deck.pop())
+        player_total = _blackjack_hand_value(player)
+
+    while (
+        dealer_total < 17
+        and dealer_total <= 21
+    ):
+        dealer.append(deck.pop())
+        dealer_total = _blackjack_hand_value(dealer)
+
+    won = False
+    draw = False
+    multiplier = 0.0
+
+    if player_natural and dealer_natural:
+        draw = True
+
+    elif player_natural:
+        won = True
+        multiplier = BLACKJACK_NATURAL_MULTIPLIER
+
+    elif player_total > 21:
+        won = False
+
+    elif dealer_total > 21:
+        won = True
+        multiplier = BLACKJACK_WIN_MULTIPLIER
+
+    elif player_total > dealer_total:
+        won = True
+        multiplier = BLACKJACK_WIN_MULTIPLIER
+
+    elif player_total == dealer_total:
+        draw = True
+
+    else:
+        won = False
+
+    if draw and BLACKJACK_DRAW_REFUND:
+        await change_balance(
+            session,
+            chat_id,
+            user_id,
+            -bet,
+            "game_bet",
+            "Ставка: blackjack",
+        )
+
+        await change_balance(
+            session,
+            chat_id,
+            user_id,
+            bet,
+            "game_payout",
+            "Возврат ставки: blackjack",
+        )
+
+        member = await get_member(
+            session,
+            chat_id,
+            user_id,
+        )
+
+        if member:
+            await reconcile_member_state(
+                session,
+                member,
+            )
+
+            member.games_played += 1
+
+        session.add(
+            Game(
+                chat_id=chat_id,
+                user_id=user_id,
+                game_type="blackjack",
+                bet=bet,
+                result=(
+                    f"player:{player_total};"
+                    f"dealer:{dealer_total};draw"
+                ),
+                multiplier=1.0,
+                payout=bet,
+                won=False,
+                status="finished",
+            )
+        )
+
+        await session.flush()
+
+        return ServiceResult(
+            True,
+            (
+                "🃏 <b>Blackjack</b>\n\n"
+                f"Твои карты: <b>{' '.join(_blackjack_card_text(card) for card in player)}</b>\n"
+                f"Твой счёт: <b>{player_total}</b>\n"
+                f"Карты дилера: <b>{' '.join(_blackjack_card_text(card) for card in dealer)}</b>\n"
+                f"Счёт дилера: <b>{dealer_total}</b>\n\n"
+                "🤝 Ничья. Ставка возвращена."
+            ),
+            changed=True,
+        )
+
+    payout = await finish_game(
+        session,
+        chat_id,
+        user_id,
+        "blackjack",
+        bet,
+        (
+            f"player:{player_total};"
+            f"dealer:{dealer_total};"
+            f"{'win' if won else 'loss'}"
+        ),
+        multiplier,
+        won,
+    )
+
+    return ServiceResult(
+        True,
+        (
+            "🃏 <b>Blackjack</b>\n\n"
+            f"Твои карты: <b>{' '.join(_blackjack_card_text(card) for card in player)}</b>\n"
+            f"Твой счёт: <b>{player_total}</b>\n"
+            f"Карты дилера: <b>{' '.join(_blackjack_card_text(card) for card in dealer)}</b>\n"
+            f"Счёт дилера: <b>{dealer_total}</b>\n\n"
+            + (
+                f"🎉 Выплата: <b>{format_balance(payout)}</b> 🥜"
+                if won
+                else "💀 Ставка проиграна."
+            )
+        ),
+        changed=True,
+    )
+
+
+# ============================================================================
+# CRASH
+# ============================================================================
+
+async def play_crash(
+    session: AsyncSession,
+    chat_id: int,
+    user_id: int,
+    bet: int,
+    cashout_multiplier: float = 2.0,
+) -> ServiceResult:
+    if bet < CRASH_MIN_BET:
+        return ServiceResult(
+            False,
+            (
+                "❌ Минимальная ставка Crash — "
+                f"<b>{format_balance(CRASH_MIN_BET)}</b> 🥜."
+            ),
+        )
+
+    try:
+        cashout_multiplier = float(cashout_multiplier)
+    except (TypeError, ValueError):
+        return ServiceResult(
+            False,
+            "❌ Некорректный множитель вывода.",
+        )
+
+    cashout_multiplier = round(
+        cashout_multiplier,
+        2,
+    )
+
+    if not (
+        CRASH_MIN_MULTIPLIER
+        <= cashout_multiplier
+        <= CRASH_MAX_MULTIPLIER
+    ):
+        return ServiceResult(
+            False,
+            (
+                "❌ Множитель вывода должен быть от "
+                f"<b>{CRASH_MIN_MULTIPLIER:.2f}x</b> "
+                f"до <b>{CRASH_MAX_MULTIPLIER:.2f}x</b>."
+            ),
+        )
+
+    _, error = await prepare_game(
+        session,
+        chat_id,
+        user_id,
+        "crash",
+        bet,
+    )
+
+    if error:
+        return error
+
+    random_value = max(
+        RNG.random(),
+        0.0001,
+    )
+
+    crash_multiplier = 1.0 / random_value
+
+    crash_multiplier = min(
+        CRASH_MAX_MULTIPLIER,
+        max(
+            CRASH_MIN_MULTIPLIER,
+            crash_multiplier,
+        ),
+    )
+
+    crash_multiplier = round(
+        crash_multiplier,
+        2,
+    )
+
+    won = cashout_multiplier <= crash_multiplier
+
+    payout = await finish_game(
+        session,
+        chat_id,
+        user_id,
+        "crash",
+        bet,
+        (
+            f"crash:{crash_multiplier:.2f};"
+            f"cashout:{cashout_multiplier:.2f}"
+        ),
+        cashout_multiplier if won else 0.0,
+        won,
+    )
+
+    if won:
+        result_text = (
+            f"🚀 <b>Crash</b>\n\n"
+            f"💥 Краш произошёл на: <b>{crash_multiplier:.2f}x</b>\n"
+            f"🎯 Твой вывод: <b>{cashout_multiplier:.2f}x</b>\n\n"
+            f"🎉 Выплата: <b>{format_balance(payout)}</b> 🥜"
+        )
+    else:
+        result_text = (
+            f"🚀 <b>Crash</b>\n\n"
+            f"💥 Краш произошёл на: <b>{crash_multiplier:.2f}x</b>\n"
+            f"🎯 Твой вывод: <b>{cashout_multiplier:.2f}x</b>\n\n"
+            "💀 Ставка проиграна."
+        )
+
+    return ServiceResult(
+        True,
+        result_text,
+        changed=True,
+    )
+
+
 async def create_game(
     session: AsyncSession,
     chat_id: int,
@@ -2156,6 +2540,8 @@ async def create_game(
         "slots": play_slots,
         "football": play_football,
         "basketball": play_basketball,
+        "blackjack": play_blackjack,
+        "crash": play_crash,
     }
 
     handler = handlers.get(game_type)
@@ -2405,16 +2791,17 @@ async def join_tictactoe(
             show_alert=True,
         )
 
-    await reconcile_member_state(
+    player_x_member = await get_member(
         session,
-        (
-            await get_member(
-                session,
-                game.chat_id,
-                game.player_x_id,
-            )
-        ),
+        game.chat_id,
+        game.player_x_id,
     )
+
+    if player_x_member is not None:
+        await reconcile_member_state(
+            session,
+            player_x_member,
+        )
 
     target_member = await get_member(
         session,
@@ -2618,7 +3005,8 @@ async def tictactoe_move(
             text = (
                 "⭕❌ <b>Игра окончена!</b>\n\n"
                 f"Победитель: "
-                f'<a href="tg://user?id={winner_id}">игрок</a> 🎉\n'
+                f'<a href="tg://user?id={winner_id}">'
+                "игрок</a> 🎉\n"
                 f"🏆 Выигрыш: "
                 f"<b>{format_balance(game.bet * 2)}</b> 🥜"
             )
@@ -4610,41 +4998,6 @@ async def admin_set_level(
 # CASES
 # ============================================================================
 
-CASE_REWARDS = {
-    "basic_case": [
-        ("peanuts", 100, 45),
-        ("peanuts", 250, 30),
-        ("item:condom", 1, 15),
-        ("item:lubricant", 1, 8),
-        ("item:dildo", 1, 2),
-    ],
-    "rare_case": [
-        ("peanuts", 500, 40),
-        ("peanuts", 1000, 25),
-        ("item:condom", 2, 12),
-        ("item:lubricant", 2, 10),
-        ("item:dildo", 1, 8),
-        ("item:rubber_pussy", 1, 5),
-    ],
-    "epic_case": [
-        ("peanuts", 2500, 35),
-        ("peanuts", 5000, 25),
-        ("item:dildo", 1, 12),
-        ("item:rubber_pussy", 1, 10),
-        ("item:silicone_implant", 1, 8),
-        ("tag:living_legend", 1, 2),
-    ],
-    "legendary_case": [
-        ("peanuts", 10000, 30),
-        ("peanuts", 25000, 25),
-        ("item:rubber_pussy", 1, 15),
-        ("item:silicone_implant", 1, 15),
-        ("item:dildo", 1, 10),
-        ("tag:living_legend", 1, 5),
-    ],
-}
-
-
 def _weighted_choice(rewards):
     total = sum(
         reward[2]
@@ -5121,6 +5474,8 @@ def get_games_keyboard() -> InlineKeyboardMarkup:
         ("football", "⚽ Футбол"),
         ("basketball", "🏀 Баскетбол"),
         ("tictactoe", "⭕❌ TTT"),
+        ("blackjack", "🃏 Blackjack"),
+        ("crash", "🚀 Crash"),
     ]:
         builder.button(
             text=title,
