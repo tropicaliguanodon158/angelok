@@ -27,6 +27,7 @@ from aiogram.types import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeDefault,
 )
+from sqlalchemy import select
 
 from core import (
     APP_NAME,
