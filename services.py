@@ -169,9 +169,13 @@ ADULT_RP_COST_VALUE = ADULT_RP_COST
 ROB_COOLDOWN = ROB_COOLDOWN_SECONDS
 
 DISEASE_TICK_INTERVAL = 60 * 60
+DISEASE_TICK_COST = DISEASE_MEDICINE_COST
+
 CHILD_DURATION = CHILD_DURATION_HOURS * 60 * 60
 CHILD_SUPPORT_COST = CHILD_SUPPORT_PER_HOUR
 ABORT_COST_VALUE = ABORT_COST
+
+RUBBER_DAILY_INTERVAL = 24 * 60 * 60
 
 GAME_FEATURES = {
     "coinflip": "coinflip",
@@ -450,6 +454,32 @@ async def grant_item(
     if item is None:
         return None
 
+    if item_code == SILICONE_IMPLANT_ITEM_CODE:
+        member = await get_member(
+            session,
+            chat_id,
+            user_id,
+        )
+
+        if member is None:
+            member = await ensure_member(
+                session,
+                chat_id,
+                user_id,
+            )
+
+        member.penis_size = round(
+            max(
+                0,
+                member.penis_size
+                + SILICONE_IMPLANT_BONUS * quantity,
+            ),
+            2,
+        )
+
+        await session.flush()
+        return None
+
     user_item = await get_user_item(
         session,
         chat_id,
@@ -487,6 +517,15 @@ async def grant_item(
                 user_item.quantity + quantity,
             )
 
+        if (
+            item_code == DILDO_ITEM_CODE
+            and user_item.uses_left is None
+        ):
+            user_item.uses_left = RNG.randint(
+                DILDO_MIN_USES,
+                DILDO_MAX_USES,
+            )
+
     await session.flush()
     return user_item
 
@@ -495,6 +534,14 @@ async def _consume_user_item(
     session: AsyncSession,
     item: UserItem,
 ) -> None:
+    if item.uses_left is not None:
+        if item.uses_left > 1:
+            item.uses_left -= 1
+            return
+
+        await session.delete(item)
+        return
+
     if item.quantity > 1:
         item.quantity -= 1
     else:
@@ -515,11 +562,92 @@ async def _has_item(
     )
 
 
+async def reconcile_rubber_pussy_daily(
+    session: AsyncSession,
+    member: ChatMember,
+) -> float:
+    item = await _has_item(
+        session,
+        member.chat_id,
+        member.user_id,
+        RUBBER_PUSSY_ITEM_CODE,
+    )
+
+    if item is None:
+        return 0.0
+
+    now = utcnow()
+
+    if member.last_rubber_daily_bonus_at is not None:
+        elapsed = (
+            now - member.last_rubber_daily_bonus_at
+        ).total_seconds()
+
+        if elapsed < RUBBER_DAILY_INTERVAL:
+            return 0.0
+
+    member.last_rubber_daily_bonus_at = now
+
+    if RNG.random() >= RUBBER_PUSSY_DAILY_CHANCE:
+        return 0.0
+
+    member.penis_size = round(
+        max(
+            0.0,
+            member.penis_size
+            + RUBBER_PUSSY_DAILY_BONUS,
+        ),
+        2,
+    )
+
+    return RUBBER_PUSSY_DAILY_BONUS
+
+
+async def reconcile_member_state(
+    session: AsyncSession,
+    member: ChatMember,
+) -> None:
+    await reconcile_disease(
+        session,
+        member,
+    )
+
+    await reconcile_child(
+        session,
+        member,
+    )
+
+    await reconcile_rubber_pussy_daily(
+        session,
+        member,
+    )
+
+    await session.flush()
+
+
 async def format_inventory(
     session: AsyncSession,
     chat_id: int,
     user_id: int,
 ) -> str:
+    member = await get_member(
+        session,
+        chat_id,
+        user_id,
+    )
+
+    if member is None:
+        member = await ensure_member(
+            session,
+            chat_id,
+            user_id,
+        )
+
+    await reconcile_member_state(
+        session,
+        member,
+    )
+
     items = await get_user_items(
         session,
         chat_id,
@@ -843,13 +971,16 @@ async def handle_message(
         user_id=message.from_user.id,
     )
 
+    await reconcile_member_state(
+        session,
+        member,
+    )
+
     now = utcnow()
     old_level = member.level
 
     member.messages += 1
 
-    # 1 сообщение = +1 XP.
-    # Никакого cooldown для XP нет.
     member.xp += config.message_xp
 
     new_level = level_from_xp(member.xp)
@@ -862,7 +993,16 @@ async def handle_message(
         member,
     )
 
-    # Денежная награда имеет отдельный cooldown.
+    post_bp_level = level_from_xp(member.xp)
+
+    if post_bp_level > member.level:
+        member.level = post_bp_level
+
+    new_level = max(
+        new_level,
+        member.level,
+    )
+
     reward_allowed = True
 
     if member.last_message_at is not None:
@@ -1009,6 +1149,11 @@ async def format_profile(
             user_id,
         )
 
+    await reconcile_member_state(
+        session,
+        member,
+    )
+
     user = await session.get(
         User,
         user_id,
@@ -1065,16 +1210,83 @@ async def format_profile(
         else ""
     )
 
-    disease_text = (
-        "\n🦠 Болезнь: <b>есть</b>"
-        if member.has_disease
-        else ""
+    disease_text = ""
+
+    if member.has_disease:
+        disease_remaining = cooldown_remaining(
+            member.last_disease_check_at
+            if hasattr(member, "last_disease_check_at")
+            else None,
+            DISEASE_TICK_INTERVAL,
+        )
+
+        next_tick_text = ""
+
+        if member.next_disease_tick is not None:
+            next_tick_text = (
+                " "
+                f"(следующий тик через "
+                f"<b>{format_seconds(max(0, int((member.next_disease_tick - utcnow()).total_seconds())))}</b>)"
+            )
+
+        disease_text = (
+            "\n🦠 Болезнь: <b>есть</b>"
+            f"{next_tick_text}"
+            f"\n💊 Лечение: <b>{format_balance(DISEASE_MEDICINE_COST)}</b> 🥜"
+            f"\n🧑‍⚕️ Венеролог: <b>{format_balance(VENEREOLOGIST_COST)}</b> 🥜"
+        )
+
+    child_text = ""
+
+    if member.has_child:
+        child_remaining = 0
+
+        if member.child_until is not None:
+            child_remaining = max(
+                0,
+                int(
+                    (
+                        member.child_until
+                        - utcnow()
+                    ).total_seconds()
+                ),
+            )
+
+        child_text = (
+            "\n👶 Ребёнок: <b>есть</b>"
+            f"\n⏳ Осталось: <b>{format_seconds(child_remaining)}</b>"
+            f"\n🥜 Содержание: <b>{format_balance(CHILD_SUPPORT_COST)}</b>/час"
+            f"\n🏥 Аборт: <b>{format_balance(ABORT_COST_VALUE)}</b> 🥜"
+        )
+
+    adult_cooldown = ADULT_RP_COOLDOWN
+    masturbation_cooldown = MASTURBATION_COOLDOWN
+
+    rubber = await _has_item(
+        session,
+        chat_id,
+        user_id,
+        RUBBER_PUSSY_ITEM_CODE,
     )
 
-    child_text = (
-        "\n👶 Ребёнок: <b>есть</b>"
-        if member.has_child
-        else ""
+    if rubber:
+        adult_cooldown *= RUBBER_PUSSY_COOLDOWN_MULTIPLIER
+        masturbation_cooldown *= RUBBER_PUSSY_COOLDOWN_MULTIPLIER
+
+    adult_remaining = cooldown_remaining(
+        member.last_adult_rp_at,
+        adult_cooldown,
+    )
+
+    masturbation_remaining = cooldown_remaining(
+        member.last_masturbation_at,
+        masturbation_cooldown,
+    )
+
+    cooldown_text = (
+        "\n\n⏱ <b>Cooldown</b>"
+        f"\n18+ RP: <b>{format_seconds(adult_remaining)}</b>"
+        f"\n😏 Мастурбация: <b>{format_seconds(masturbation_remaining)}</b>"
     )
 
     return (
@@ -1095,6 +1307,7 @@ async def format_profile(
         f"💀 Поражений: <b>{format_balance(member.games_lost)}</b>"
         f"{disease_text}"
         f"{child_text}"
+        f"{cooldown_text}"
     )
 
 
@@ -1123,6 +1336,11 @@ async def format_stats(
 
     if member is None:
         return "❌ Профиль не найден."
+
+    await reconcile_member_state(
+        session,
+        member,
+    )
 
     return (
         "📊 <b>Статистика</b>\n\n"
@@ -1155,6 +1373,11 @@ async def balance_user(
             user_id,
         )
 
+    await reconcile_member_state(
+        session,
+        member,
+    )
+
     return member.balance
 
 
@@ -1183,6 +1406,16 @@ async def get_leaderboard(
         chat_id,
         5,
     )
+
+    for member in (
+        balance_top
+        + xp_top
+        + size_top
+    ):
+        await reconcile_member_state(
+            session,
+            member,
+        )
 
     def render(
         title: str,
@@ -1241,6 +1474,11 @@ async def claim_daily_bonus(
             user_id,
         )
 
+    await reconcile_member_state(
+        session,
+        member,
+    )
+
     if member.last_bonus_at is not None:
         elapsed = (
             utcnow() - member.last_bonus_at
@@ -1293,6 +1531,42 @@ async def transfer_money(
 
     if sender_id == receiver_id:
         return ServiceResult(False, "😐 Самому себе переводить нельзя.")
+
+    sender_member = await get_member(
+        session,
+        chat_id,
+        sender_id,
+    )
+
+    if sender_member is None:
+        sender_member = await ensure_member(
+            session,
+            chat_id,
+            sender_id,
+        )
+
+    receiver_member = await get_member(
+        session,
+        chat_id,
+        receiver_id,
+    )
+
+    if receiver_member is None:
+        receiver_member = await ensure_member(
+            session,
+            chat_id,
+            receiver_id,
+        )
+
+    await reconcile_member_state(
+        session,
+        sender_member,
+    )
+
+    await reconcile_member_state(
+        session,
+        receiver_member,
+    )
 
     _, error = await can_afford(
         session,
@@ -1382,6 +1656,11 @@ async def prepare_game(
             ),
         )
 
+    await reconcile_member_state(
+        session,
+        member,
+    )
+
     return member, None
 
 
@@ -1423,6 +1702,11 @@ async def finish_game(
     )
 
     if member:
+        await reconcile_member_state(
+            session,
+            member,
+        )
+
         member.games_played += 1
 
         if won:
@@ -1982,6 +2266,11 @@ async def start_tictactoe(
             user_id,
         )
 
+    await reconcile_member_state(
+        session,
+        member,
+    )
+
     required_level = get_feature_required_level(
         "tictactoe"
     ) or 10
@@ -2114,6 +2403,29 @@ async def join_tictactoe(
             error,
             answer="Недостаточно арахиса.",
             show_alert=True,
+        )
+
+    await reconcile_member_state(
+        session,
+        (
+            await get_member(
+                session,
+                game.chat_id,
+                game.player_x_id,
+            )
+        ),
+    )
+
+    target_member = await get_member(
+        session,
+        game.chat_id,
+        user_id,
+    )
+
+    if target_member is not None:
+        await reconcile_member_state(
+            session,
+            target_member,
         )
 
     game.player_o_id = user_id
@@ -2286,11 +2598,19 @@ async def tictactoe_move(
             )
 
             if winner_member:
+                await reconcile_member_state(
+                    session,
+                    winner_member,
+                )
                 winner_member.games_played += 1
                 winner_member.games_won += 1
                 winner_member.total_won += game.bet
 
             if loser_member:
+                await reconcile_member_state(
+                    session,
+                    loser_member,
+                )
                 loser_member.games_played += 1
                 loser_member.games_lost += 1
                 loser_member.total_lost += game.bet
@@ -2407,6 +2727,36 @@ async def perform_rp(
             "❌ Пользователь не найден.",
         )
 
+    actor_member = await get_member(
+        session,
+        chat_id,
+        actor_id,
+    )
+
+    if actor_member is None:
+        actor_member = await ensure_member(
+            session,
+            chat_id,
+            actor_id,
+        )
+
+    await reconcile_member_state(
+        session,
+        actor_member,
+    )
+
+    target_member = await get_member(
+        session,
+        chat_id,
+        target_id,
+    )
+
+    if target_member is not None:
+        await reconcile_member_state(
+            session,
+            target_member,
+        )
+
     _, error = await can_afford(
         session,
         chat_id,
@@ -2508,6 +2858,16 @@ async def perform_adult_rp(
             target_id,
         )
 
+    await reconcile_member_state(
+        session,
+        actor_member,
+    )
+
+    await reconcile_member_state(
+        session,
+        target_member,
+    )
+
     now = utcnow()
 
     if actor_member.has_child:
@@ -2517,6 +2877,7 @@ async def perform_adult_rp(
         ):
             actor_member.has_child = False
             actor_member.child_until = None
+            actor_member.last_child_support = None
         else:
             return ServiceResult(
                 False,
@@ -2687,6 +3048,17 @@ async def perform_adult_rp(
     if actor_member.has_disease:
         extra += "\n🦠 У тебя есть риск болезни."
 
+    rubber_growth = await reconcile_rubber_pussy_daily(
+        session,
+        actor_member,
+    )
+
+    if rubber_growth:
+        extra += (
+            "\n🧸 Rubber Pussy: "
+            f"+{rubber_growth:.2f} см за день."
+        )
+
     await session.flush()
 
     return ServiceResult(
@@ -2725,6 +3097,26 @@ async def masturbate(
             user_id,
         )
 
+    await reconcile_member_state(
+        session,
+        member,
+    )
+
+    now = utcnow()
+
+    dildo = await _has_item(
+        session,
+        chat_id,
+        user_id,
+        DILDO_ITEM_CODE,
+    )
+
+    dildo_available = bool(
+        dildo
+        and dildo.uses_left is not None
+        and dildo.uses_left > 0
+    )
+
     cooldown = MASTURBATION_COOLDOWN
 
     rubber = await _has_item(
@@ -2737,19 +3129,20 @@ async def masturbate(
     if rubber:
         cooldown *= RUBBER_PUSSY_COOLDOWN_MULTIPLIER
 
-    remaining = cooldown_remaining(
-        member.last_masturbation_at,
-        cooldown,
-    )
-
-    if remaining:
-        return ServiceResult(
-            False,
-            (
-                "⏳ Команда пока недоступна.\n"
-                f"Осталось: <b>{format_seconds(remaining)}</b>."
-            ),
+    if not dildo_available:
+        remaining = cooldown_remaining(
+            member.last_masturbation_at,
+            cooldown,
         )
+
+        if remaining:
+            return ServiceResult(
+                False,
+                (
+                    "⏳ Команда пока недоступна.\n"
+                    f"Осталось: <b>{format_seconds(remaining)}</b>."
+                ),
+            )
 
     if rubber:
         gain = RNG.uniform(
@@ -2762,6 +3155,17 @@ async def masturbate(
             MASTURBATION_MAX_GAIN,
         )
 
+    extra = ""
+
+    if dildo_available and dildo is not None:
+        await _consume_user_item(
+            session,
+            dildo,
+        )
+        extra = (
+            "\n🪀 Использован Dildo."
+        )
+
     member.penis_size = round(
         max(
             0,
@@ -2770,9 +3174,39 @@ async def masturbate(
         2,
     )
 
-    member.last_masturbation_at = utcnow()
+    member.last_masturbation_at = now
+
+    rubber_growth = await reconcile_rubber_pussy_daily(
+        session,
+        member,
+    )
+
+    if rubber_growth:
+        extra += (
+            "\n🧸 Rubber Pussy: "
+            f"+{rubber_growth:.2f} см за день."
+        )
 
     await session.flush()
+
+    dildo_left = None
+
+    if dildo_available:
+        updated_dildo = await _has_item(
+            session,
+            chat_id,
+            user_id,
+            DILDO_ITEM_CODE,
+        )
+
+        if updated_dildo is not None:
+            dildo_left = updated_dildo.uses_left
+
+    if dildo_available and dildo_left is not None:
+        extra += (
+            f"\n🪀 Осталось использований Dildo: "
+            f"<b>{dildo_left}</b>"
+        )
 
     return ServiceResult(
         True,
@@ -2780,6 +3214,7 @@ async def masturbate(
             "😏 Действие выполнено.\n"
             f"📏 Размер: <b>{member.penis_size:.2f} см</b>"
             f"\n📈 Рост: <b>+{gain:.2f} см</b>"
+            f"{extra}"
         ),
         changed=True,
     )
@@ -2818,6 +3253,16 @@ async def rob_user(
             False,
             "❌ Пользователь не найден.",
         )
+
+    await reconcile_member_state(
+        session,
+        actor,
+    )
+
+    await reconcile_member_state(
+        session,
+        target,
+    )
 
     remaining = cooldown_remaining(
         actor.last_rob_at,
@@ -2937,6 +3382,21 @@ async def reconcile_disease(
             ),
             2,
         )
+
+        charge = min(
+            DISEASE_TICK_COST,
+            max(0, member.balance),
+        )
+
+        if charge > 0:
+            await change_balance(
+                session,
+                member.chat_id,
+                member.user_id,
+                -charge,
+                "disease_tick",
+                "Ежечасный расход при болезни",
+            )
 
         member.next_disease_tick += timedelta(hours=1)
         ticks += 1
@@ -3080,6 +3540,46 @@ async def reconcile_child(
 
     now = utcnow()
 
+    if member.last_child_support is None:
+        member.last_child_support = now
+
+    support_until = now
+
+    if member.child_until is not None:
+        support_until = min(
+            support_until,
+            member.child_until,
+        )
+
+    elapsed_seconds = (
+        support_until - member.last_child_support
+    ).total_seconds()
+
+    elapsed_hours = int(
+        max(0, elapsed_seconds)
+        // 3600
+    )
+
+    for _ in range(elapsed_hours):
+        charge = min(
+            CHILD_SUPPORT_COST,
+            max(0, member.balance),
+        )
+
+        if charge > 0:
+            await change_balance(
+                session,
+                member.chat_id,
+                member.user_id,
+                -charge,
+                "child_support",
+                "Содержание ребёнка",
+            )
+
+        member.last_child_support += timedelta(
+            hours=1
+        )
+
     if (
         member.child_until is not None
         and member.child_until <= now
@@ -3087,37 +3587,6 @@ async def reconcile_child(
         member.has_child = False
         member.child_until = None
         member.last_child_support = None
-        return
-
-    if member.last_child_support is None:
-        member.last_child_support = now
-        return
-
-    elapsed_hours = int(
-        (
-            now - member.last_child_support
-        ).total_seconds()
-        // 3600
-    )
-
-    if elapsed_hours <= 0:
-        return
-
-    amount = elapsed_hours * CHILD_SUPPORT_COST
-
-    if member.balance >= amount:
-        await change_balance(
-            session,
-            member.chat_id,
-            member.user_id,
-            -amount,
-            "child_support",
-            "Содержание ребёнка",
-        )
-
-    member.last_child_support += timedelta(
-        hours=elapsed_hours
-    )
 
 
 async def child_status(
@@ -4299,12 +4768,18 @@ async def open_case(
             amount,
         )
 
+        item_reward_text = (
+            "автоматически использован"
+            if item_code == SILICONE_IMPLANT_ITEM_CODE
+            else escape(item.name if item else item_code)
+        )
+
         return ServiceResult(
             True,
             (
                 "📦 <b>Кейс открыт!</b>\n\n"
                 f"🎁 Получено: "
-                f"<b>{escape(item.name if item else item_code)}</b>"
+                f"<b>{item_reward_text}</b>"
             ),
             changed=True,
         )
@@ -4361,6 +4836,44 @@ async def create_giveaway(
             "❌ Тип приза: peanuts, item или external.",
         )
 
+    if ends_at <= utcnow():
+        return ServiceResult(
+            False,
+            "❌ Время окончания должно быть в будущем.",
+        )
+
+    if prize_type == "peanuts":
+        if prize_amount is None or prize_amount <= 0:
+            return ServiceResult(
+                False,
+                "❌ Сумма приза должна быть положительной.",
+            )
+
+    elif prize_type == "item":
+        if not prize_item_code:
+            return ServiceResult(
+                False,
+                "❌ Укажи код предмета.",
+            )
+
+        item = await get_inventory_item(
+            session,
+            prize_item_code,
+        )
+
+        if item is None:
+            return ServiceResult(
+                False,
+                "❌ Предмет для розыгрыша не найден.",
+            )
+
+    elif prize_type == "external":
+        if not prize_description:
+            return ServiceResult(
+                False,
+                "❌ Для внешнего приза нужно описание.",
+            )
+
     giveaway = Giveaway(
         chat_id=chat_id,
         creator_id=creator_id,
@@ -4375,13 +4888,44 @@ async def create_giveaway(
     session.add(giveaway)
     await session.flush()
 
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎉 Участвовать",
+                    callback_data=f"giveaway:join:{giveaway.id}",
+                )
+            ]
+        ]
+    )
+
+    prize_text = ""
+
+    if prize_type == "peanuts":
+        prize_text = (
+            f"🥜 Приз: <b>{format_balance(prize_amount or 0)}</b>"
+        )
+    elif prize_type == "item":
+        prize_text = (
+            f"🎁 Предмет: <code>{escape(prize_item_code or '')}</code>"
+        )
+    else:
+        prize_text = (
+            "📦 Внешний приз:\n"
+            f"<b>{escape(prize_description or '')}</b>\n"
+            "⚠️ Выдача внешнего приза производится вручную."
+        )
+
     return ServiceResult(
         True,
         (
-            "🎉 Розыгрыш создан!\n"
-            f"ID: <code>{giveaway.id}</code>"
+            "🎉 <b>Розыгрыш создан!</b>\n\n"
+            f"ID: <code>{giveaway.id}</code>\n"
+            f"{prize_text}\n"
+            f"⏳ До: <b>{giveaway.ends_at}</b>"
         ),
         changed=True,
+        keyboard=keyboard,
     )
 
 
@@ -4397,23 +4941,52 @@ async def join_giveaway(
     )
 
     if giveaway is None:
-        return ServiceResult(False, "❌ Розыгрыш не найден.")
+        return ServiceResult(
+            False,
+            "❌ Розыгрыш не найден.",
+            answer="Розыгрыш не найден.",
+            show_alert=True,
+        )
+
+    if giveaway.chat_id != chat_id:
+        return ServiceResult(
+            False,
+            "❌ Этот розыгрыш относится к другому чату.",
+            answer="Розыгрыш относится к другому чату.",
+            show_alert=True,
+        )
 
     if giveaway.status != "active":
-        return ServiceResult(False, "❌ Розыгрыш уже завершён.")
+        return ServiceResult(
+            False,
+            "❌ Розыгрыш уже завершён.",
+            answer="Розыгрыш уже завершён.",
+            show_alert=True,
+        )
 
     if giveaway.ends_at <= utcnow():
-        return ServiceResult(False, "⏰ Розыгрыш уже закончился.")
+        return ServiceResult(
+            False,
+            "⏰ Розыгрыш уже закончился.",
+            answer="Розыгрыш уже закончился.",
+            show_alert=True,
+        )
 
     existing = await session.execute(
         select(GiveawayParticipant).where(
             GiveawayParticipant.giveaway_id == giveaway_id,
             GiveawayParticipant.user_id == user_id,
+            GiveawayParticipant.chat_id == chat_id,
         )
     )
 
     if existing.scalar_one_or_none():
-        return ServiceResult(False, "❌ Ты уже участвуешь.")
+        return ServiceResult(
+            False,
+            "❌ Ты уже участвуешь.",
+            answer="Ты уже участвуешь.",
+            show_alert=True,
+        )
 
     session.add(
         GiveawayParticipant(
@@ -4429,12 +5002,14 @@ async def join_giveaway(
         True,
         "🎉 Ты участвуешь в розыгрыше!",
         changed=True,
+        answer="Ты участвуешь в розыгрыше!",
     )
 
 
 async def finish_giveaway(
     session: AsyncSession,
     giveaway_id: int,
+    chat_id: Optional[int] = None,
 ) -> ServiceResult:
     giveaway = await session.get(
         Giveaway,
@@ -4444,12 +5019,22 @@ async def finish_giveaway(
     if giveaway is None:
         return ServiceResult(False, "❌ Розыгрыш не найден.")
 
+    if (
+        chat_id is not None
+        and giveaway.chat_id != chat_id
+    ):
+        return ServiceResult(
+            False,
+            "❌ Этот розыгрыш относится к другому чату.",
+        )
+
     if giveaway.status != "active":
         return ServiceResult(False, "❌ Розыгрыш уже завершён.")
 
     result = await session.execute(
         select(GiveawayParticipant).where(
             GiveawayParticipant.giveaway_id == giveaway_id,
+            GiveawayParticipant.chat_id == giveaway.chat_id,
         )
     )
 
@@ -4490,6 +5075,22 @@ async def finish_giveaway(
                 winner.user_id,
                 giveaway.prize_item_code,
             )
+
+    elif giveaway.prize_type == "external":
+        await session.flush()
+
+        return ServiceResult(
+            True,
+            (
+                "🎉 <b>Розыгрыш завершён!</b>\n"
+                f'Победитель: <a href="tg://user?id={winner.user_id}">'
+                "игрок</a>\n"
+                f"📦 Внешний приз: "
+                f"<b>{escape(giveaway.prize_description or 'без описания')}</b>\n"
+                "⚠️ Приз необходимо выдать вручную."
+            ),
+            changed=True,
+        )
 
     await session.flush()
 
