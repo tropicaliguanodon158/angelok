@@ -66,6 +66,7 @@ from services import (
     format_balance,
     format_inventory,
     format_other_profile,
+    resolve_target,
     format_profile,
     format_stats,
     get_leaderboard,
@@ -3082,49 +3083,56 @@ async def execute_rp(
     if not message.from_user:
         return None
 
-    action_alias, target_text = parse_rp_text(
-        message
-    )
+    action_alias, target_text = parse_rp_text(message)
 
     if not action_alias:
         return None
 
-    adult_action = get_adult_rp_action(
-        action_alias
+    target_token = (
+        target_text.split()[0]
+        if target_text
+        else ""
     )
 
+    adult_action = get_adult_rp_action(action_alias)
+
     if adult_action is not None:
-        target_id = None
-
-        if message.reply_to_message:
-            target = message.reply_to_message.from_user
-
-            if target:
-                target_id = target.id
-
-        if (
-            target_id is None
-            and target_text
-        ):
-            parsed = parse_integer(
-                target_text.split()[0]
-            )
-
-            if parsed is not None:
-                target_id = parsed
-
-        if target_id is None:
-            return ServiceResult(
-                success=False,
-                message=(
-                    "🎭 18+ RP нужно использовать "
-                    "ответом на сообщение пользователя."
-                ),
-                answer="Нет цели.",
-                show_alert=True,
-            )
-
         async with AsyncSessionLocal() as session:
+            target = None
+
+            if message.reply_to_message:
+                target = message.reply_to_message.from_user
+                target_id = target.id if target else None
+            else:
+                target_id = parse_integer(target_token)
+
+                if target_id is not None:
+                    target = await resolve_target(
+                        session=session,
+                        chat_id=message.chat.id,
+                        target_user_id=target_id,
+                    )
+                elif target_token.startswith("@"):
+                    target = await resolve_target(
+                        session=session,
+                        chat_id=message.chat.id,
+                        target_username=target_token,
+                    )
+                    target_id = target.id if target else None
+                else:
+                    target_id = None
+
+            if target_id is None:
+                return ServiceResult(
+                    success=False,
+                    message=(
+                        "🎭 18+ RP используй ответом "
+                        "на сообщение или укажи @username."
+                    ),
+                    answer="Нет цели.",
+                    show_alert=True,
+                )
+
             result = await perform_adult_rp(
                 session=session,
                 chat_id=message.chat.id,
@@ -3133,51 +3141,50 @@ async def execute_rp(
                 action=adult_action.key,
             )
 
-            await commit_result(
-                session,
-                result,
-            )
+            await commit_result(session, result)
+            return result
 
-        return result
-
-    action = get_rp_action_by_alias(
-        action_alias
-    )
+    action = get_rp_action_by_alias(action_alias)
 
     if action is None:
         return None
 
-    target_id = None
-
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-
-        if target:
-            target_id = target.id
-
-    if (
-        target_id is None
-        and target_text
-    ):
-        parsed = parse_integer(
-            target_text.split()[0]
-        )
-
-        if parsed is not None:
-            target_id = parsed
-
-    if target_id is None:
-        return ServiceResult(
-            success=False,
-            message=(
-                "🎭 Используй RP-команду "
-                "ответом на сообщение пользователя."
-            ),
-            answer="Нет цели.",
-            show_alert=True,
-        )
-
     async with AsyncSessionLocal() as session:
+        target = None
+
+        if message.reply_to_message:
+            target = message.reply_to_message.from_user
+            target_id = target.id if target else None
+        else:
+            target_id = parse_integer(target_token)
+
+            if target_id is not None:
+                target = await resolve_target(
+                    session=session,
+                    chat_id=message.chat.id,
+                    target_user_id=target_id,
+                )
+            elif target_token.startswith("@"):
+                target = await resolve_target(
+                    session=session,
+                    chat_id=message.chat.id,
+                    target_username=target_token,
+                )
+                target_id = target.id if target else None
+            else:
+                target_id = None
+
+        if target_id is None:
+            return ServiceResult(
+                success=False,
+                message=(
+                    "🎭 Используй RP-команду "
+                    "ответом на сообщение или укажи @username."
+                ),
+                answer="Нет цели.",
+                show_alert=True,
+            )
+
         result = await perform_rp(
             session=session,
             chat_id=message.chat.id,
@@ -3186,12 +3193,8 @@ async def execute_rp(
             action=action[0],
         )
 
-        await commit_result(
-            session,
-            result,
-        )
-
-    return result
+        await commit_result(session, result)
+        return result
 
 
 # ============================================================================
@@ -4003,11 +4006,11 @@ async def cmd_giveaway(
 
     prize_type = args[0].lower()
 
-    try:
-        duration_minutes = int(
-            args[-1]
-        )
-    except ValueError:
+    duration_minutes = parse_integer(
+        args[-1]
+    )
+
+    if duration_minutes is None:
         await reply(
             message,
             "❌ Длительность должна быть числом минут.",
