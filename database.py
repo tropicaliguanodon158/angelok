@@ -155,11 +155,13 @@ class Chat(Base):
         back_populates="chat",
         uselist=False,
         cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
     members: Mapped[list["ChatMember"]] = relationship(
         back_populates="chat",
         cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
 
@@ -231,6 +233,7 @@ class ChatSettings(Base):
 
     chat: Mapped["Chat"] = relationship(
         back_populates="settings",
+        lazy="selectin",
     )
 
 
@@ -480,12 +483,16 @@ class ChatMember(Base):
 
     chat: Mapped["Chat"] = relationship(
         back_populates="members",
+        lazy="selectin",
     )
 
-    user: Mapped["User"] = relationship()
+    user: Mapped["User"] = relationship(
+        lazy="selectin",
+    )
 
     selected_tag: Mapped[Optional["Tag"]] = relationship(
         foreign_keys=[selected_tag_id],
+        lazy="selectin",
     )
 
     __table_args__ = (
@@ -1148,7 +1155,9 @@ class UserItem(Base):
         nullable=False,
     )
 
-    item: Mapped["InventoryItem"] = relationship()
+    item: Mapped["InventoryItem"] = relationship(
+        lazy="selectin",
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -1238,7 +1247,9 @@ class UserTag(Base):
         nullable=False,
     )
 
-    tag: Mapped["Tag"] = relationship()
+    tag: Mapped["Tag"] = relationship(
+        lazy="selectin",
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -1448,7 +1459,10 @@ async def get_or_create_chat(
     title: Optional[str] = None,
     chat_type: str = "group",
 ) -> Chat:
-    chat = await session.get(Chat, chat_id)
+    chat = await session.get(
+        Chat,
+        chat_id,
+    )
 
     if chat is None:
         chat = Chat(
@@ -1459,10 +1473,11 @@ async def get_or_create_chat(
         session.add(chat)
         await session.flush()
 
-        settings = ChatSettings(
-            chat_id=chat_id,
+        session.add(
+            ChatSettings(
+                chat_id=chat_id,
+            )
         )
-        session.add(settings)
         await session.flush()
 
         return chat
@@ -1505,7 +1520,10 @@ async def get_or_create_user(
     last_name: Optional[str] = None,
     is_bot: bool = False,
 ) -> User:
-    user = await session.get(User, user_id)
+    user = await session.get(
+        User,
+        user_id,
+    )
 
     if user is None:
         user = User(
@@ -1725,7 +1743,9 @@ async def get_top_by_balance(
 ) -> list[ChatMember]:
     result = await session.execute(
         select(ChatMember)
-        .where(ChatMember.chat_id == chat_id)
+        .where(
+            ChatMember.chat_id == chat_id,
+        )
         .order_by(
             ChatMember.balance.desc(),
             ChatMember.user_id.asc(),
@@ -1743,7 +1763,9 @@ async def get_top_by_xp(
 ) -> list[ChatMember]:
     result = await session.execute(
         select(ChatMember)
-        .where(ChatMember.chat_id == chat_id)
+        .where(
+            ChatMember.chat_id == chat_id,
+        )
         .order_by(
             ChatMember.xp.desc(),
             ChatMember.user_id.asc(),
@@ -1761,7 +1783,9 @@ async def get_top_by_messages(
 ) -> list[ChatMember]:
     result = await session.execute(
         select(ChatMember)
-        .where(ChatMember.chat_id == chat_id)
+        .where(
+            ChatMember.chat_id == chat_id,
+        )
         .order_by(
             ChatMember.messages.desc(),
             ChatMember.user_id.asc(),
@@ -1779,7 +1803,9 @@ async def get_top_by_penis_size(
 ) -> list[ChatMember]:
     result = await session.execute(
         select(ChatMember)
-        .where(ChatMember.chat_id == chat_id)
+        .where(
+            ChatMember.chat_id == chat_id,
+        )
         .order_by(
             ChatMember.penis_size.desc(),
             ChatMember.user_id.asc(),
@@ -1802,8 +1828,7 @@ async def get_member_rank_by_xp(
     )
 
     result = await session.execute(
-        select(ChatMember.id)
-        .where(
+        select(ChatMember.id).where(
             ChatMember.chat_id == chat_id,
             ChatMember.xp > member.xp,
         )
@@ -1824,8 +1849,7 @@ async def get_member_rank_by_balance(
     )
 
     result = await session.execute(
-        select(ChatMember.id)
-        .where(
+        select(ChatMember.id).where(
             ChatMember.chat_id == chat_id,
             ChatMember.balance > member.balance,
         )
@@ -1846,8 +1870,7 @@ async def get_member_rank_by_penis_size(
     )
 
     result = await session.execute(
-        select(ChatMember.id)
-        .where(
+        select(ChatMember.id).where(
             ChatMember.chat_id == chat_id,
             ChatMember.penis_size > member.penis_size,
         )
@@ -1893,7 +1916,9 @@ async def _column_names(
 
     if dialect == "sqlite":
         result = await connection.execute(
-            text(f'PRAGMA table_info("{table_name}")')
+            text(
+                f'PRAGMA table_info("{table_name}")'
+            )
         )
 
         return {
@@ -1933,7 +1958,9 @@ async def _sqlite_table_exists(
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name=:name"
         ),
-        {"name": table_name},
+        {
+            "name": table_name,
+        },
     )
 
     return result.scalar_one_or_none() is not None
@@ -2048,22 +2075,14 @@ async def _create_postgres_index_if_missing(
     )
 
 
-async def run_migrations(connection) -> None:
-    """
-    Добавляет новые колонки в уже существующую БД.
-
-    Новые таблицы сначала создаются через create_all().
-    После этого миграции добавляют недостающие колонки
-    в старые таблицы.
-
-    Миграции рассчитаны на SQLite и PostgreSQL.
-    """
-
+async def run_migrations(
+    connection,
+) -> None:
     dialect = connection.dialect.name
 
-    # ========================================================================
+    # ------------------------------------------------------------------------
     # CHAT MEMBERS
-    # ========================================================================
+    # ------------------------------------------------------------------------
 
     chat_members_exists = (
         await _sqlite_table_exists(
@@ -2165,9 +2184,9 @@ async def run_migrations(connection) -> None:
             "chat_id, xp",
         )
 
-    # ========================================================================
+    # ------------------------------------------------------------------------
     # GAMES
-    # ========================================================================
+    # ------------------------------------------------------------------------
 
     games_exists = (
         await _sqlite_table_exists(
@@ -2217,9 +2236,9 @@ async def run_migrations(connection) -> None:
             "player2_id",
         )
 
-    # ========================================================================
+    # ------------------------------------------------------------------------
     # GIVEAWAY PARTICIPANTS
-    # ========================================================================
+    # ------------------------------------------------------------------------
 
     participants_exists = (
         await _sqlite_table_exists(
@@ -2246,13 +2265,11 @@ async def run_migrations(connection) -> None:
     )
 
     if participants_exists:
-        chat_definition = "BIGINT"
-
         await _add_column_if_missing(
             connection,
             "giveaway_participants",
             "chat_id",
-            chat_definition,
+            "BIGINT",
         )
 
         if giveaways_exists:
@@ -2263,7 +2280,8 @@ async def run_migrations(connection) -> None:
                     SET chat_id = (
                         SELECT giveaways.chat_id
                         FROM giveaways
-                        WHERE giveaways.id = giveaway_participants.giveaway_id
+                        WHERE giveaways.id =
+                              giveaway_participants.giveaway_id
                     )
                     WHERE chat_id IS NULL
                     """
@@ -2283,9 +2301,9 @@ async def run_migrations(connection) -> None:
             "chat_id",
         )
 
-    # ========================================================================
+    # ------------------------------------------------------------------------
     # MODERATION PERMISSION COMPATIBILITY
-    # ========================================================================
+    # ------------------------------------------------------------------------
 
     permissions_exists = (
         await _sqlite_table_exists(
@@ -2324,9 +2342,9 @@ async def run_migrations(connection) -> None:
                 )
             )
 
-    # ========================================================================
+    # ------------------------------------------------------------------------
     # GIVEAWAY COMPATIBILITY
-    # ========================================================================
+    # ------------------------------------------------------------------------
 
     if giveaways_exists:
         await _add_column_if_missing(
@@ -2343,20 +2361,12 @@ async def run_migrations(connection) -> None:
             "BIGINT",
         )
 
-        if dialect == "sqlite":
-            await _add_column_if_missing(
-                connection,
-                "giveaways",
-                "finished_at",
-                "DATETIME",
-            )
-        else:
-            await _add_column_if_missing(
-                connection,
-                "giveaways",
-                "finished_at",
-                "TIMESTAMP",
-            )
+        await _add_column_if_missing(
+            connection,
+            "giveaways",
+            "finished_at",
+            "DATETIME" if dialect == "sqlite" else "TIMESTAMP",
+        )
 
         columns = await _column_names(
             connection,
@@ -2451,7 +2461,10 @@ STATIC_INVENTORY_ITEMS = (
     {
         "code": "condom",
         "name": "Презерватив",
-        "description": "Одноразовый предмет. Снижает риск болезни и беременности.",
+        "description": (
+            "Одноразовый предмет. "
+            "Снижает риск болезни и беременности."
+        ),
         "item_type": "item",
         "max_quantity": None,
         "stackable": True,
@@ -2460,7 +2473,9 @@ STATIC_INVENTORY_ITEMS = (
     {
         "code": "lubricant",
         "name": "Лубрикант",
-        "description": "Одноразовый бонус к росту при 18+ RP.",
+        "description": (
+            "Одноразовый бонус к росту при 18+ RP."
+        ),
         "item_type": "item",
         "max_quantity": None,
         "stackable": True,
@@ -2469,7 +2484,10 @@ STATIC_INVENTORY_ITEMS = (
     {
         "code": "dildo",
         "name": "Dildo",
-        "description": "Даёт несколько дополнительных использований мастурбации.",
+        "description": (
+            "Даёт несколько дополнительных "
+            "использований мастурбации."
+        ),
         "item_type": "item",
         "max_quantity": 1,
         "stackable": False,
@@ -2478,7 +2496,10 @@ STATIC_INVENTORY_ITEMS = (
     {
         "code": "rubber_pussy",
         "name": "Rubber Pussy",
-        "description": "Снижает cooldown мастурбации и 18+ RP и даёт ежедневный шанс роста.",
+        "description": (
+            "Снижает cooldown мастурбации и 18+ RP "
+            "и даёт ежедневный шанс роста."
+        ),
         "item_type": "item",
         "max_quantity": 1,
         "stackable": False,
@@ -2487,7 +2508,10 @@ STATIC_INVENTORY_ITEMS = (
     {
         "code": "silicone_implant",
         "name": "Силиконовый имплант",
-        "description": "Одноразовый предмет, который автоматически увеличивает размер.",
+        "description": (
+            "Одноразовый предмет, "
+            "который автоматически увеличивает размер."
+        ),
         "item_type": "item",
         "max_quantity": None,
         "stackable": False,
@@ -2530,8 +2554,6 @@ async def seed_static_data(
             )
             continue
 
-        changed = False
-
         for field_name in (
             "name",
             "description",
@@ -2548,10 +2570,6 @@ async def seed_static_data(
                     field_name,
                     expected,
                 )
-                changed = True
-
-        if changed:
-            item.created_at = item.created_at or utcnow()
 
     for tag_data in STATIC_TAGS:
         result = await session.execute(
@@ -2587,11 +2605,6 @@ async def seed_static_data(
 
 
 async def initialize_database() -> None:
-    """
-    Создаёт таблицы, выполняет совместимые миграции
-    и гарантирует наличие статических предметов/тегов.
-    """
-
     async with engine.begin() as connection:
         await connection.run_sync(
             Base.metadata.create_all
@@ -2621,12 +2634,6 @@ async def delete_chat_data(
     session: AsyncSession,
     chat_id: int,
 ) -> None:
-    """
-    Удаляет игровые данные чата.
-
-    Используется только административными процедурами.
-    """
-
     giveaway_ids_result = await session.execute(
         select(Giveaway.id).where(
             Giveaway.chat_id == chat_id,
