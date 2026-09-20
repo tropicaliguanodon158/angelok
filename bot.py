@@ -352,10 +352,6 @@ async def configure_bot_commands(
             description="Исключить",
         ),
         BotCommand(
-            command="purge",
-            description="Удалить сообщения",
-        ),
-        BotCommand(
             command="setnick",
             description="Изменить ник",
         ),
