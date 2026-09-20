@@ -1555,7 +1555,6 @@ MODERATION_ACTIONS = {
     "ban",
     "unban",
     "kick",
-    "purge",
     "setnick",
 }
 
@@ -1595,8 +1594,6 @@ DEFAULT_MODERATION_PERMISSIONS: dict[str, str] = {
     "unban": "admin",
 
     "kick": "staff",
-
-    "purge": "staff",
 
     "setnick": "admin",
 }
