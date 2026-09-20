@@ -407,7 +407,7 @@ async def cmd_profile(
             text = await format_other_profile(
                 session=session,
                 chat_id=message.chat.id,
-                user_id=target_id,
+                target_user_id=target_id,
             )
 
         keyboard = None
@@ -1278,7 +1278,7 @@ async def callback_ttt_move(callback: CallbackQuery) -> None:
             session=session,
             game_id=game_id,
             user_id=callback.from_user.id,
-            cell=cell,
+            position=cell,
         )
 
         if result.success:
@@ -1319,6 +1319,42 @@ async def callback_games_menu(
         )
     except TelegramBadRequest:
         pass
+
+
+@router.callback_query(F.data.startswith("game:"))
+async def callback_game(
+    callback: CallbackQuery,
+) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+
+    game_type = (callback.data or "").split(":", 1)[1]
+
+    instructions = {
+        "coinflip": "🪙 Используй <code>/coinflip 100</code>",
+        "dice": "🎲 Используй <code>/dice 100</code>",
+        "slots": "🎰 Используй <code>/slots 100</code>",
+        "roulette": "🎡 Используй <code>/roulette 100 red</code>",
+        "guess": "🔢 Используй <code>/guess 100 5</code>",
+        "football": "⚽ Используй <code>/football 100</code>",
+        "basketball": "🏀 Используй <code>/basketball 100</code>",
+        "tictactoe": "⭕❌ Используй <code>/ttt</code>",
+    }
+
+    text = instructions.get(game_type)
+
+    if text is None:
+        await callback.answer(
+            "Неизвестная игра.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer(
+        text,
+        show_alert=True,
+    )
 
 
 # ============================================================================
@@ -1474,7 +1510,7 @@ async def execute_rp(
             chat_id=message.chat.id,
             actor_id=message.from_user.id,
             target_id=target_id,
-            action=action.key,
+            action=action[0],
         )
 
         if result.success:
@@ -1772,6 +1808,78 @@ async def cmd_purge(
         moderator_id=message.from_user.id,
         count=amount,
     )
+
+    await reply(message, result.message)
+
+
+@router.message(Command("setnick"))
+async def cmd_setnick(
+    message: Message,
+    command: CommandObject,
+) -> None:
+    if not message.from_user:
+        return
+
+    args = (command.args or "").strip()
+
+    target_id = reply_target_id(message)
+
+    if target_id is None:
+        parts = args.split(maxsplit=1)
+
+        if not parts:
+            await reply(
+                message,
+                (
+                    "Использование:\n"
+                    "/setnick НОВЫЙ_НИК ответом\n"
+                    "или /setnick USER_ID НОВЫЙ_НИК"
+                ),
+            )
+            return
+
+        parsed_target = parse_integer(parts[0])
+
+        if parsed_target is not None and len(parts) == 2:
+            target_id = parsed_target
+            nick = parts[1]
+        else:
+            target_id = message.from_user.id
+            nick = args
+    else:
+        nick = args
+
+    if target_id is None or not nick:
+        await reply(
+            message,
+            "❌ Укажи пользователя и новый ник.",
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        allowed, error = await check_moderation_access(
+            session=session,
+            chat_id=message.chat.id,
+            actor_id=message.from_user.id,
+            command="setnick",
+        )
+
+        if not allowed:
+            await reply(
+                message,
+                error or "❌ Недостаточно прав.",
+            )
+            return
+
+        result = await set_profile_nick(
+            session=session,
+            chat_id=message.chat.id,
+            user_id=target_id,
+            nick=nick,
+        )
+
+        if result.success:
+            await session.commit()
 
     await reply(message, result.message)
 
